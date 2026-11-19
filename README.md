@@ -2,6 +2,9 @@
 
 Explore US Census data through natural language with multi-agent intelligence.
 
+For development decisions, tradeoffs, unresolved failure modes, and the testing
+strategy, see [Project Reflection](REFLECTION.md).
+
 ## Web and local usage
 
 ### Hosted web application
