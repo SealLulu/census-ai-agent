@@ -12,6 +12,7 @@ Functions / 包含函数:
 - load_allowed_users: Load the user allowlist. / 读取允许用户列表。
 - load_chat_history_limit: Load the history tail limit. / 读取历史记录加载数量。
 - load_api_key: Load the OpenAI API key. / 读取 OpenAI API Key。
+- load_snowflake_config: Load Snowflake settings. / 读取 Snowflake 配置。
 - load_config: Validate and assemble AppConfig. / 校验并组装 AppConfig。
 - ensure_chat_storage: Create or migrate user history files. / 创建或迁移用户记录文件。
 - initialize_application: Run the complete cold-start sequence. / 执行完整冷启动流程。
@@ -23,6 +24,7 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
+from uuid import uuid4
 
 import streamlit as st
 
@@ -33,12 +35,27 @@ CHAT_HISTORY_DIR = BASE_DIR / "chat_history"
 
 
 @dataclass(frozen=True)
+class SnowflakeConfig:
+    """Validated Snowflake settings. / 已完成校验的 Snowflake 配置。"""
+
+    account: str
+    user: str
+    warehouse: str
+    schema: str
+    auth_method: str = "password"
+    password: str | None = None
+    token: str | None = None
+    role: str | None = None
+
+
+@dataclass(frozen=True)
 class AppConfig:
     """Validated application settings. / 已完成校验的应用配置。"""
 
     allowed_users: list[str]
     openai_api_key: str
     chat_history_load_limit: int
+    snowflake: SnowflakeConfig
 
 
 def get_chat_history_path(username: str) -> Path:
@@ -90,13 +107,18 @@ def _legacy_messages_to_records(
         # 旧文件不含时间、SQL 或有效性信息，迁移时使用兼容默认值。
         records.append(
             {
+                "chat_id": str(uuid4()),
                 "text": message["content"],
+                "rewritten_question": message["content"],
                 "time_stamp": "",
                 "valid_status": 0,
                 "response": response,
                 "response_status": response_status,
                 "sql": "",
                 "sql_resp": "",
+                "intent_status": "",
+                "pending_question": "",
+                "pending_clarification": "",
             }
         )
         index += 1
@@ -192,6 +214,82 @@ def load_api_key() -> str | None:
     return api_key.strip() if api_key else None
 
 
+def load_snowflake_config() -> SnowflakeConfig:
+    """Load Snowflake settings, preferring server secrets. / 优先读取服务器配置。"""
+    local_path = STARTUP_DIR / "snowflake.toml"
+    try:
+        with local_path.open("rb") as local_file:
+            local_section = tomllib.load(local_file).get("SNOWFLAKE", {})
+    except FileNotFoundError:
+        local_section = {}
+    except tomllib.TOMLDecodeError as error:
+        raise ValueError(f"Invalid TOML file: {local_path}") from error
+    if not isinstance(local_section, dict):
+        raise ValueError("Local SNOWFLAKE configuration must be a TOML table.")
+
+    try:
+        server_section = st.secrets["SNOWFLAKE"]
+    except Exception:
+        server_section = {}
+
+    def read_value(field: str) -> object:
+        """Read one server-first Snowflake setting. / 读取一个服务器优先的 Snowflake 配置。"""
+        try:
+            return server_section[field]
+        except Exception:
+            return local_section.get(field)
+
+    required_fields = ("account", "user", "warehouse", "schema")
+    values: dict[str, str | None] = {}
+    for field in required_fields:
+        # Each server value overrides its local counterpart independently.
+        # 每个服务器字段分别覆盖对应的本地配置，未配置项仍可使用本地值。
+        value = read_value(field)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                f"SNOWFLAKE.{field} must be configured as a non-empty string."
+            )
+        values[field] = value.strip()
+
+    auth_method_value = read_value("auth_method") or "password"
+    if not isinstance(auth_method_value, str):
+        raise ValueError("SNOWFLAKE.auth_method must be a string.")
+    auth_method = auth_method_value.strip().lower()
+    if auth_method not in {"password", "oauth", "programmatic_access_token"}:
+        raise ValueError(
+            "SNOWFLAKE.auth_method must be 'password', 'oauth', or "
+            "'PROGRAMMATIC_ACCESS_TOKEN'."
+        )
+    values["auth_method"] = auth_method
+
+    # Only the credential required by the selected authentication mode is mandatory.
+    # 仅强制要求当前认证模式使用的凭据，避免同时保存密码和 OAuth token。
+    credential_field = (
+        "token"
+        if auth_method in {"oauth", "programmatic_access_token"}
+        else "password"
+    )
+    credential = read_value(credential_field)
+    if not isinstance(credential, str) or not credential.strip():
+        raise ValueError(
+            f"SNOWFLAKE.{credential_field} must be configured as a non-empty string "
+            f"when auth_method is '{auth_method}'."
+        )
+    values[credential_field] = credential.strip()
+    values[
+        "password"
+        if auth_method in {"oauth", "programmatic_access_token"}
+        else "token"
+    ] = None
+
+    role = read_value("role")
+    if role is not None and not isinstance(role, str):
+        raise ValueError("SNOWFLAKE.role must be a string when configured.")
+    values["role"] = role.strip() if isinstance(role, str) and role.strip() else None
+
+    return SnowflakeConfig(**values)
+
+
 def load_config() -> AppConfig:
     """Load and validate all startup settings. / 加载并校验全部启动配置。"""
     # Build one immutable config object only after every required value is valid.
@@ -207,11 +305,13 @@ def load_config() -> AppConfig:
             "OPENAI_API_KEY was not found in Streamlit Secrets, "
             "startup/openai_key.toml, or the local environment."
         )
+    snowflake_config = load_snowflake_config()
 
     return AppConfig(
         allowed_users=allowed_users,
         openai_api_key=openai_api_key,
         chat_history_load_limit=chat_history_load_limit,
+        snowflake=snowflake_config,
     )
 
 

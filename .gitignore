@@ -170,3 +170,6 @@ cython_debug/
 
 # Local OpenAI credential
 startup/openai_key.toml
+
+# Local Snowflake credentials
+startup/snowflake.toml

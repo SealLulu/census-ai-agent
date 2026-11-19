@@ -1,119 +1,160 @@
 """
 Summary / 文件概要:
-Implement the main chat pipeline: inspect the current user intent, obtain optional
-data-source context through a caller-provided loader, and generate the answer.
-实现聊天主流程：检查当前用户意图，通过调用方提供的加载器取得可选数据源上下文，
-然后生成回答。
+Implement the main chat workflow using recent history and pending clarification
+state, then optionally query Census data and generate an answer.
+使用最近历史与待澄清状态实现聊天主流程，然后按需查询 Census 数据并生成答案。
 
 Functions / 包含函数:
-- detect_conversation_intent: Classify the current input. / 判断当前输入的对话意图。
-- generate_answer: Generate a streamed answer. / 生成流式回答。
-- run_chat_flow: Run intent detection and answer generation. / 执行意图检查与答案生成主流程。
+- run_chat_flow: Execute the main chat workflow. / 执行聊天主流程。
 """
 
-from collections.abc import Callable
+from dataclasses import dataclass
+import re
 from typing import Any
 
 from openai import OpenAI
 
-
-MODEL_NAME = "gpt-4o-mini"
-INTENT_CENSUS_DATA = "census_data"
-INTENT_GENERAL = "general_conversation"
-
-
-def detect_conversation_intent(client: OpenAI, user_input: str) -> str:
-    """Classify the current input. / 判断当前输入的对话意图。"""
-    # Ask for a strict label so downstream routing does not parse free-form text.
-    # 要求模型只返回固定标签，避免下游路由解析自然语言描述。
-    completion = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Classify the user's latest message into exactly one label: "
-                    "census_data for US Census, population, demographic, housing, "
-                    "or related data questions; general_conversation for every "
-                    "other message. Return only the label."
-                ),
-            },
-            {"role": "user", "content": user_input},
-        ],
-    )
-
-    intent = (completion.choices[0].message.content or "").strip().lower()
-    if intent == INTENT_CENSUS_DATA:
-        return INTENT_CENSUS_DATA
-    # Unknown or malformed labels safely fall back to general conversation.
-    # 未知或格式错误的标签统一安全回退为普通对话。
-    return INTENT_GENERAL
+from agents import answer_agent, intent_agent
+from cold_start import SnowflakeConfig
+from data_source import census_data_service, schema_retriever, sql_agent
 
 
-def generate_answer(
-    client: OpenAI,
-    history_messages: list[dict[str, str]],
-    user_input: str,
-    data_input: str | None,
-) -> Any:
-    """Generate from user and data input. / 根据用户输入与数据输入生成回答。"""
-    system_content = (
-        "You are Census AI Assistant. Answer clearly and concisely."
-    )
-    if data_input:
-        # Retrieved context becomes the factual basis for data-related answers.
-        # 查询到的数据上下文作为数据类回答的事实依据。
-        system_content += (
-            " Use the following data-source context as the factual basis for the "
-            f"answer:\n{data_input}"
-        )
-    else:
-        # Explicitly limit the model when no verified Census context is available.
-        # 没有可信 Census 数据上下文时，明确限制模型不得编造精确数据。
-        system_content += (
-            " No external Census data source returned context. Be transparent "
-            "about that limitation and do not invent precise statistics."
-        )
+MAX_INTENT_HISTORY_MESSAGES = 10
 
-    # Streaming lets the page display the answer incrementally.
-    # 流式输出使页面可以逐步显示生成内容。
-    return client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
-            {"role": "system", "content": system_content},
-            *history_messages,
-            {"role": "user", "content": user_input},
-        ],
-        stream=True,
-    )
+
+@dataclass(frozen=True)
+class ChatFlowResult:
+    """Result passed from workflow to page. / 从聊天主流程返回给页面的结果。"""
+
+    is_valid: bool
+    status: str
+    sql: str
+    sql_response: str
+    rewritten_question: str = ""
+    answer_stream: Any | None = None
+    direct_response: str = ""
+    update_pending: bool = False
+    pending_question: str | None = None
+    pending_clarification: str | None = None
 
 
 def run_chat_flow(
     client: OpenAI,
     user_input: str,
     history_messages: list[dict[str, str]],
-    data_input_loader: Callable[[str], str | None],
-) -> tuple[bool, Any]:
-    """Run intent check and answer generation. / 执行意图检查与答案生成。"""
-    # Step 1: inspect the current input intent.
-    # 第一步：检查当前输入的对话意图。
-    intent = detect_conversation_intent(client, user_input)
+    pending_list: list[dict[str, str]],
+    snowflake_config: SnowflakeConfig,
+) -> ChatFlowResult:
+    """Run intent, optional data query, and answer generation. / 执行意图、查询与生成。"""
+    recent_history = history_messages[-MAX_INTENT_HISTORY_MESSAGES:]
 
-    # Non-Census input is marked invalid and does not enter answer generation.
-    # 非 Census 输入被视为无效意图，不进入答案生成阶段。
-    if intent != INTENT_CENSUS_DATA:
-        return False, None
-
-    # The page layer owns the data-source integration and provides its loader.
-    # 页面层负责数据源集成，并向聊天流程提供加载函数。
-    data_input = data_input_loader(user_input)
-
-    # Step 2: generate an answer from history, user input, and data input.
-    # 第二步：结合历史消息、用户输入和数据输入生成回答。
-    stream = generate_answer(
+    # Step 1: classify and rewrite the question; Intent never generates SQL.
+    # 第一步：识别意图并补全问题；Intent 不再生成 SQL。
+    intent_result = intent_agent.detect_conversation_intent(
         client=client,
-        history_messages=history_messages,
+        history_messages=recent_history,
+        pending_list=pending_list,
         user_input=user_input,
+    )
+    if not intent_result.is_valid:
+        return ChatFlowResult(
+            is_valid=False,
+            status=intent_result.status,
+            sql="",
+            sql_response="",
+            rewritten_question="",
+        )
+
+    # Save or update pending state when the Intent Agent asks for clarification.
+    # Intent Agent 主动追问时保存或更新待澄清状态。
+    if (
+        intent_result.resolution
+        == intent_agent.RESOLUTION_NEEDS_CLARIFICATION
+    ):
+        return ChatFlowResult(
+            is_valid=True,
+            status=intent_result.status,
+            sql="",
+            sql_response="",
+            rewritten_question=intent_result.standalone_question,
+            direct_response=intent_result.response_text,
+            update_pending=True,
+            pending_question=intent_result.standalone_question,
+            pending_clarification=intent_result.response_text,
+        )
+
+    # Step 2: retrieve only the Schema required by the standalone question.
+    # 第二步：只检索独立问题所需的 Schema。
+    year_matches = re.findall(
+        r"\b(?:19|20)\d{2}\b", intent_result.standalone_question
+    )
+    schema_year = int(year_matches[-1]) if year_matches else 2020
+    try:
+        schema_context = schema_retriever.retrieve_schema(
+            intent_result.standalone_question,
+            year=schema_year,
+        )
+    except (FileNotFoundError, ValueError) as error:
+        return ChatFlowResult(
+            is_valid=True,
+            status=intent_result.status,
+            sql="",
+            sql_response="",
+            rewritten_question=intent_result.standalone_question,
+            direct_response=f"Unable to retrieve the required Census schema: {error}",
+            update_pending=True,
+        )
+
+    # Step 3: generate schema-grounded SQL. It is still not executed here.
+    # 第三步：基于检索结果生成 SQL；此时仍未执行。
+    generated_sql = sql_agent.generate_sql(
+        client=client,
+        question=intent_result.standalone_question,
+        schema_context=schema_context,
+        schema_name=snowflake_config.schema,
+    )
+    if generated_sql.status == "insufficient_schema":
+        missing = ", ".join(generated_sql.required_schema)
+        detail = f" Required schema: {missing}." if missing else ""
+        return ChatFlowResult(
+            is_valid=True,
+            status=intent_result.status,
+            sql="",
+            sql_response="",
+            rewritten_question=intent_result.standalone_question,
+            direct_response=generated_sql.reason + detail,
+            update_pending=True,
+        )
+
+    # Step 4: validation occurs inside the connector before Snowflake execution.
+    # 第四步：Connector 在执行 Snowflake SQL 前完成校验。
+    data_input = census_data_service.query_census_data(
+        generated_sql.sql,
+        snowflake_config,
+        schema_context,
+    )
+
+    # Step 5: FOLLOW_UP receives recent history; NEW receives no history.
+    # 第五步：FOLLOW_UP 带入最近历史；NEW 不带入历史。
+    answer_history = (
+        recent_history
+        if intent_result.status == intent_agent.STATUS_FOLLOW_UP
+        else []
+    )
+    stream = answer_agent.generate_answer(
+        client=client,
+        history_messages=answer_history,
+        user_input=intent_result.standalone_question,
         data_input=data_input,
     )
-    return True, stream
+    return ChatFlowResult(
+        is_valid=True,
+        status=intent_result.status,
+        sql=generated_sql.sql,
+        sql_response=data_input or "",
+        rewritten_question=intent_result.standalone_question,
+        answer_stream=stream,
+        # Any completed NEW/FOLLOW_UP clears previous pending state.
+        # 完成 NEW/FOLLOW_UP 后清除旧的待澄清状态。
+        update_pending=True,
+    )

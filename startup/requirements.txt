@@ -1,2 +1,5 @@
 streamlit
 openai
+pydantic
+sqlglot
+snowflake-connector-python

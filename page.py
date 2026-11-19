@@ -1,316 +1,171 @@
 """
 Summary / 文件概要:
-Render login and chat pages, read and append per-user JSONL history records,
-invoke the chat pipeline, and provide the page-level data-source integration point.
-渲染登录与聊天页面，读取并追加每个用户的 JSONL 历史记录，调用聊天主流程，
-并提供页面层的数据源集成入口。
-
-JSONL history format / JSONL 历史记录格式（每行一条完整问答记录）:
-{
-    "text": "",             # User input / 用户输入
-    "time_stamp": "",       # ISO 8601 time / ISO 8601 时间
-    "valid_status": 0,       # 0: valid / 有效; -1: invalid / 无效
-    "response": "",         # Empty when invalid / 无效时为空
-    "response_status": 0,    # 0: normal / 正常; non-zero: pending / 待处理
-    "sql": "",              # Executed SQL / 执行的 SQL
-    "sql_resp": ""          # SQL result / SQL 返回结果
-}
+Expose the two page-level operations used by the Streamlit entry point: loading
+history and processing one current user input with streamed output.
+仅提供 Streamlit 入口需要的两个页面级操作：加载历史，以及处理一次当前用户输入并
+输出流式回复。
 
 Functions / 包含函数:
-- load_chat_history: Load the latest JSONL records. / 读取最后若干条 JSONL 记录。
-- history_records_to_messages: Convert records for model context. / 转换为模型消息。
-- append_chat_record: Append one complete Q&A record. / 追加一条完整问答记录。
-- load_data_input: Obtain data input for the user input. / 根据用户输入获取数据输入。
-- initialize_session_state: Initialize Streamlit state. / 初始化 Streamlit 会话状态。
-- render_login: Render and validate login. / 渲染并校验登录页面。
-- render_chat: Render chat and persist new records. / 渲染聊天并保存新记录。
-- render_app: Route between login and chat. / 在登录与聊天页面之间路由。
+- load_history: Load the latest history records. / 加载最新历史记录。
+- chat: Process and persist one user input. / 处理并保存一次用户输入。
 """
 
-import json
-from collections import deque
-from datetime import datetime, timezone
 from typing import Any
 
 import streamlit as st
 from openai import OpenAI
 
-from chat import run_chat_flow
-from cold_start import AppConfig, get_chat_history_path
+import chat as chat_workflow
+from cold_start import SnowflakeConfig
+from services import history_service
 
 
-PAGE_TITLE = "Census AI | US Population Insights"
-PAGE_HEADING = "Census AI Assistant"
-PAGE_SUBTITLE = (
-    "Explore US Census data through natural language with multi-agent intelligence."
-)
-
-VALID_STATUS_VALID = 0
-VALID_STATUS_INVALID = -1
-RESPONSE_STATUS_NORMAL = 0
-RESPONSE_STATUS_PENDING = 1
-INVALID_RESPONSE_TEXT = "我无法回复你的问题"
-
-HISTORY_STRING_FIELDS = (
-    "text",
-    "time_stamp",
-    "response",
-    "sql",
-    "sql_resp",
-)
-HISTORY_STATUS_FIELDS = ("valid_status", "response_status")
+def load_history(username: str, load_limit: int) -> list[dict[str, Any]]:
+    """Load the latest history records. / 加载用户最后若干条历史记录。"""
+    return history_service.load_history_records(username, load_limit)
 
 
-def _is_valid_history_record(record: object) -> bool:
-    """Validate one complete JSONL record. / 校验一条完整的 JSONL 历史记录。"""
-    if not isinstance(record, dict):
-        return False
-    if not all(isinstance(record.get(field), str) for field in HISTORY_STRING_FIELDS):
-        return False
-    if not all(
-        isinstance(record.get(field), int)
-        and not isinstance(record.get(field), bool)
-        for field in HISTORY_STATUS_FIELDS
-    ):
-        return False
-    if record["valid_status"] not in (
-        VALID_STATUS_VALID,
-        VALID_STATUS_INVALID,
-    ):
-        return False
-
-    # Invalid questions must not store a generated response.
-    # 无效问题不得保存模型生成的回答，页面会使用固定提示语。
-    if record["valid_status"] != VALID_STATUS_VALID and record["response"]:
-        return False
-    return True
-
-
-def load_chat_history(username: str, load_limit: int) -> list[dict[str, Any]]:
-    """Load the latest complete records. / 读取指定用户最后若干条完整问答记录。"""
-    history_path = get_chat_history_path(username)
-    with history_path.open("r", encoding="utf-8") as history_file:
-        # Keep only the requested tail, so a large history file is not fully loaded.
-        # 只保留指定数量的末尾行，避免把大型历史文件全部载入内存。
-        latest_lines = deque(
-            (line.strip() for line in history_file if line.strip()),
-            maxlen=load_limit,
-        )
-
-    records: list[dict[str, Any]] = []
-    for line in latest_lines:
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError as error:
-            raise ValueError(
-                f"Invalid JSONL chat history for user '{username}'."
-            ) from error
-
-        if not _is_valid_history_record(record):
-            raise ValueError(
-                f"Invalid chat history record for user '{username}'."
-            )
-        records.append(record)
-    return records
-
-
-def history_records_to_messages(
-    records: list[dict[str, Any]],
-) -> list[dict[str, str]]:
-    """Convert stored records into model messages. / 将历史记录转换为模型上下文消息。"""
-    messages: list[dict[str, str]] = []
-    for record in records:
-        messages.append({"role": "user", "content": record["text"]})
-
-        if record["valid_status"] != VALID_STATUS_VALID:
-            # Invalid records always use the fixed on-screen/model-context response.
-            # 无效记录始终使用固定回复，不读取其 response 字段。
-            messages.append(
-                {"role": "assistant", "content": INVALID_RESPONSE_TEXT}
-            )
-        elif (
-            record["response_status"] == RESPONSE_STATUS_NORMAL
-            and record["response"]
-        ):
-            messages.append(
-                {"role": "assistant", "content": record["response"]}
-            )
-        # Pending records currently have no assistant message.
-        # pending 记录目前不生成助手消息，后续可在这里扩展处理策略。
-    return messages
-
-
-def append_chat_record(username: str, record: dict[str, Any]) -> None:
-    """Append one complete Q&A record. / 向用户 JSONL 追加一条完整问答记录。"""
-    if not _is_valid_history_record(record):
-        raise ValueError("Cannot save an invalid chat history record.")
-
-    history_path = get_chat_history_path(username)
-    with history_path.open("a", encoding="utf-8") as history_file:
-        history_file.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-
-def _build_history_record(
+def chat(
+    client: OpenAI,
+    username: str,
     user_input: str,
-    valid_status: int,
-    response: str = "",
-    response_status: int = RESPONSE_STATUS_NORMAL,
-    sql: str = "",
-    sql_resp: str = "",
-) -> dict[str, Any]:
-    """Build a record using the canonical schema. / 按统一格式构造历史记录。"""
-    return {
-        "text": user_input,
-        "time_stamp": datetime.now(timezone.utc).isoformat(),
-        "valid_status": valid_status,
-        "response": response,
-        "response_status": response_status,
-        "sql": sql,
-        "sql_resp": sql_resp,
-    }
+    history_records: list[dict[str, Any]],
+    snowflake_config: SnowflakeConfig,
+) -> dict[str, Any] | None:
+    """Process, display, and persist one input. / 处理、显示并保存一次用户输入。"""
+    chat_id = history_service.generate_chat_id()
+    # Both containers belong to this browser's Streamlit session. They are not
+    # shared with another logged-in user, even though the server process is shared.
+    # 以下容器属于当前浏览器的 Streamlit 会话，不会与其他登录用户共享。
+    active_chat_ids: set[str] = st.session_state.active_chat_ids
+    active_chat_ids.add(chat_id)
+    pending_list: list[dict[str, str]] = st.session_state.pending_list
+    latest_pending = pending_list[-1] if pending_list else {}
 
-
-def load_data_input(user_input: str) -> str | None:
-    """Load data input for generation. / 为答案生成加载数据输入。"""
-    # This is the page-level integration point for a future Census data source.
-    # 这是页面层预留的 Census 数据源入口，后续可在这里执行并记录 SQL。
-    _ = user_input
-    return None
-
-
-def initialize_session_state() -> None:
-    """Initialize persistent session values. / 初始化跨重跑保留的会话数据。"""
-    if "username" not in st.session_state:
-        st.session_state.username = None
-    if "chat_records" not in st.session_state:
-        st.session_state.chat_records = []
-
-
-def render_page_header() -> None:
-    """Show the shared page heading. / 显示页面共用的主标题和副标题。"""
-    st.title(PAGE_HEADING)
-    st.caption(PAGE_SUBTITLE)
-
-
-def render_login(config: AppConfig) -> None:
-    """Show and validate the login form. / 显示并校验登录表单。"""
-    render_page_header()
-    st.subheader("🔐 Login")
-    st.write("Enter your username to continue to the chat.")
-
-    with st.form("login_form"):
-        username = st.text_input("Username", placeholder="Enter your username")
-        submitted = st.form_submit_button("Continue", use_container_width=True)
-
-    if not submitted:
-        return
-
-    username = username.strip()
-    if not username:
-        st.warning("Please enter a username.")
-        return
-    if username not in config.allowed_users:
-        st.error("This username is not allowed to access the chat.")
-        return
+    # Keep a pending in-memory record so a timed refresh can identify this chat
+    # and preserve it by chat_id until the final record reaches disk.
+    # 先保留一条内存 pending 记录，使定时刷新可按 chat_id 保留当前聊天。
+    pending_record = history_service.build_history_record(
+        chat_id=chat_id,
+        user_input=user_input,
+        valid_status=history_service.VALID_STATUS_VALID,
+        response_status=history_service.RESPONSE_STATUS_PENDING,
+        pending_question=latest_pending.get("pending_question", ""),
+        pending_clarification=latest_pending.get(
+            "pending_clarification", ""
+        ),
+    )
+    history_records.append(pending_record)
 
     try:
-        records = load_chat_history(username, config.chat_history_load_limit)
-    except (OSError, ValueError) as error:
-        st.error(f"Unable to load chat history: {error}")
-        return
-
-    st.session_state.username = username
-    st.session_state.chat_records = records
-    st.rerun()
-
-
-def render_chat_history() -> None:
-    """Display records as user/assistant bubbles. / 将历史记录显示为用户与助手气泡。"""
-    for message in history_records_to_messages(st.session_state.chat_records):
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-
-
-def handle_assistant_response(
-    client: OpenAI, username: str, user_input: str
-) -> None:
-    """Run chat flow and save one complete record. / 执行聊天流程并保存一条完整记录。"""
-    try:
-        # Stored records are converted only when building the model context.
-        # 仅在构造模型上下文时，才把 JSONL 问答记录转换为 role/content 消息。
-        history_messages = history_records_to_messages(
-            st.session_state.chat_records
+        history_messages = history_service.records_to_model_messages(
+            history_records[:-1]
         )
-        is_valid, stream = run_chat_flow(
+        flow_result = chat_workflow.run_chat_flow(
             client=client,
             user_input=user_input,
             history_messages=history_messages,
-            data_input_loader=load_data_input,
+            pending_list=pending_list,
+            snowflake_config=snowflake_config,
         )
 
-        if not is_valid:
-            record = _build_history_record(
+        if flow_result.update_pending:
+            if flow_result.status == history_service.INTENT_STATUS_NEW:
+                # NEW always starts a separate chain, including an incomplete
+                # new question that immediately requires clarification.
+                # NEW 始终开启新链，包括尚不完整、需要立即澄清的新问题。
+                pending_list.clear()
+
+            if (
+                flow_result.pending_question
+                and flow_result.pending_clarification
+            ):
+                # Each clarification turn is appended. This preserves repeated
+                # pending replies instead of overwriting the previous turn.
+                # 每次主动追问都追加到列表，保留用户连续多轮 pending 的过程。
+                pending_list.append(
+                    {
+                        "chat_id": chat_id,
+                        "text": user_input,
+                        "time_stamp": pending_record["time_stamp"],
+                        "pending_question": flow_result.pending_question,
+                        "pending_clarification": (
+                            flow_result.pending_clarification
+                        ),
+                    }
+                )
+                del pending_list[:-history_service.MAX_PENDING_ITEMS]
+            else:
+                # A completed or replaced question closes the whole chain.
+                # 问题完成或被新问题替换后，清空整条待澄清链。
+                pending_list.clear()
+
+        # JSONL stores the latest snapshot while memory retains the full chain.
+        # JSONL 每行保存最新快照，内存 pending_list 则保留完整待澄清链。
+        latest_pending = pending_list[-1] if pending_list else {}
+        pending_question = latest_pending.get("pending_question", "")
+        pending_clarification = latest_pending.get(
+            "pending_clarification", ""
+        )
+
+        if not flow_result.is_valid:
+            final_record = history_service.build_history_record(
+                chat_id=chat_id,
                 user_input=user_input,
-                valid_status=VALID_STATUS_INVALID,
-                response="",
+                valid_status=history_service.VALID_STATUS_INVALID,
+                rewritten_question=flow_result.rewritten_question,
+                intent_status=flow_result.status,
+                pending_question=pending_question,
+                pending_clarification=pending_clarification,
             )
             with st.chat_message("assistant"):
-                st.markdown(INVALID_RESPONSE_TEXT)
+                st.markdown(history_service.INVALID_RESPONSE_TEXT)
+        elif flow_result.direct_response:
+            # Clarification is displayed directly without data or answer generation.
+            # 主动追问直接显示，不调用数据服务或答案生成。
+            with st.chat_message("assistant"):
+                st.markdown(flow_result.direct_response)
+            final_record = history_service.build_history_record(
+                chat_id=chat_id,
+                user_input=user_input,
+                valid_status=history_service.VALID_STATUS_VALID,
+                rewritten_question=flow_result.rewritten_question,
+                response=flow_result.direct_response,
+                intent_status=flow_result.status,
+                pending_question=pending_question,
+                pending_clarification=pending_clarification,
+            )
         else:
+            if flow_result.answer_stream is None:
+                raise RuntimeError(
+                    "Valid chat flow did not return an answer stream."
+                )
             with st.chat_message("assistant"):
-                response = st.write_stream(stream)
-            record = _build_history_record(
+                response = st.write_stream(flow_result.answer_stream)
+            final_record = history_service.build_history_record(
+                chat_id=chat_id,
                 user_input=user_input,
-                valid_status=VALID_STATUS_VALID,
+                valid_status=history_service.VALID_STATUS_VALID,
+                rewritten_question=flow_result.rewritten_question,
                 response=str(response),
+                sql=flow_result.sql,
+                sql_resp=flow_result.sql_response,
+                intent_status=flow_result.status,
+                pending_question=pending_question,
+                pending_clarification=pending_clarification,
             )
 
-        # One append writes the question and its final result atomically as one line.
-        # 一次追加同时写入问题与最终结果，保证每行都是完整问答记录。
-        append_chat_record(username, record)
-        st.session_state.chat_records.append(record)
+        history_service.append_history_record(username, final_record)
+        history_records[-1] = final_record
+        return final_record
     except Exception as error:
+        # A failed request remains pending on disk for later recovery/retry logic.
+        # 失败请求以 pending 状态保存，方便后续增加恢复或重试逻辑。
+        try:
+            history_service.append_history_record(username, pending_record)
+        except (OSError, ValueError) as save_error:
+            st.error(f"Unable to save pending chat: {save_error}")
         st.error(f"An error occurred while processing the chat: {error}")
-
-
-def render_chat(client: OpenAI) -> None:
-    """Show chat for a signed-in user. / 为已登录用户显示聊天界面。"""
-    if st.sidebar.button("Log out", use_container_width=True):
-        # Logout clears browser state but intentionally keeps local history.
-        # 退出登录只清除浏览器会话，本地聊天记录继续保留。
-        st.session_state.username = None
-        st.session_state.chat_records = []
-        st.rerun()
-
-    render_page_header()
-    render_chat_history()
-
-    user_input = st.chat_input("Ask a question")
-    if not user_input:
-        return
-
-    with st.chat_message("user"):
-        st.markdown(user_input)
-    handle_assistant_response(
-        client, st.session_state.username, user_input
-    )
-
-
-def render_app(config: AppConfig) -> None:
-    """Route between login and chat. / 根据登录状态进入登录或聊天页面。"""
-    initialize_session_state()
-
-    # Revoke a current session if the user was removed from the allowlist.
-    # 如果当前用户已从允许列表删除，则撤销现有会话。
-    if (
-        st.session_state.username
-        and st.session_state.username not in config.allowed_users
-    ):
-        st.session_state.username = None
-        st.session_state.chat_records = []
-
-    if not st.session_state.username:
-        render_login(config)
-        return
-
-    render_chat(OpenAI(api_key=config.openai_api_key))
+        return pending_record
+    finally:
+        active_chat_ids.discard(chat_id)
