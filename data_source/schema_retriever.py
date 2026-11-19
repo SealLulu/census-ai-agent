@@ -105,11 +105,19 @@ METRIC_DEFINITIONS = {
         "required_role_counts": {"value": 1},
     },
     "median_household_income": {
-        "aliases": ("median household income", "household income"),
+        "aliases": ("median household income",),
         "table_suffix": "CBG_B19",
         "table_number": "B19013",
         "selector": "all_indicator_fields",
         "aggregation": "non_additive_median",
+        "required_role_counts": {"value": 1},
+    },
+    "aggregate_household_income": {
+        "aliases": ("aggregate household income", "total household income"),
+        "table_suffix": "CBG_B19",
+        "table_number": "B19025",
+        "selector": "all_indicator_fields",
+        "aggregation": "additive_currency",
         "required_role_counts": {"value": 1},
     },
     "age_65_plus": {
@@ -316,8 +324,13 @@ def _discover_metric_ids(question: str) -> list[str]:
         "total population" in text or not age_65_plus
     ):
         discovered.append("total_population")
-    if "household income" in text:
+    if "median household income" in text:
         discovered.append("median_household_income")
+    elif (
+        "aggregate household income" in text
+        or "total household income" in text
+    ):
+        discovered.append("aggregate_household_income")
     if age_65_plus:
         discovered.append("age_65_plus")
     if (

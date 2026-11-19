@@ -9,6 +9,7 @@ Functions / 包含函数:
 """
 
 import json
+import re
 from dataclasses import dataclass
 
 from google.genai import Client, types
@@ -138,6 +139,24 @@ instead of allowing an unsupported request into the data pipeline.
 """
 
 
+def _needs_income_metric_clarification(question: str) -> bool:
+    """Detect ambiguous household-income wording. / 识别含义不明确的家庭收入指标。"""
+    normalized = " ".join(question.lower().replace("-", " ").split())
+    if "household income" not in normalized:
+        return False
+    explicit_metric_patterns = (
+        r"\bmedian household income\b",
+        r"\b(?:mean|average) household income\b",
+        r"\b(?:aggregate|total) household income\b",
+        r"\bper capita (?:household )?income\b",
+        r"\bhousehold income per capita\b",
+    )
+    return not any(
+        re.search(pattern, normalized)
+        for pattern in explicit_metric_patterns
+    )
+
+
 @dataclass(frozen=True)
 class IntentResult:
     """Resolved conversation intent. / 已解析的对话意图。"""
@@ -235,6 +254,26 @@ def detect_conversation_intent(
         return IntentResult(STATUS_INVALID, RESOLUTION_NONE, "", "")
 
     resolved_question = standalone_question.strip() or user_input.strip()
+    if _needs_income_metric_clarification(resolved_question):
+        # This deterministic guard is intentionally applied after the model's
+        # rewrite. Free-tier models may occasionally ignore prompt-only
+        # clarification rules, but selecting the wrong income metric changes
+        # both the SQL and its valid aggregation semantics.
+        # 该确定性校验在模型改写后执行；收入指标选择会改变 SQL 与聚合语义，不能依赖
+        # 免费模型是否稳定遵守 Prompt。
+        clarification_status = (
+            STATUS_FOLLOW_UP if pending_list else status
+        )
+        return IntentResult(
+            clarification_status,
+            RESOLUTION_NEEDS_CLARIFICATION,
+            resolved_question,
+            (
+                "Do you mean aggregate household income or median household "
+                "income? A state-level median cannot be derived accurately "
+                "by averaging block-group medians."
+            ),
+        )
     if resolution == RESOLUTION_NEEDS_CLARIFICATION:
         clarification = response_text.strip()
         if not clarification:

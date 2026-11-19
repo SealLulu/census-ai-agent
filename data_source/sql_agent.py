@@ -145,6 +145,9 @@ Rules:
     or verified join is unavailable.
 24. median_household_income is non-additive. Do not SUM or AVG block-group
     medians to manufacture a state or county median.
+25. aggregate_household_income with aggregation_semantics=additive_currency may
+    be summed across non-overlapping block groups after applying the verified
+    geography filter. Do not confuse it with median_household_income.
 """
 
 

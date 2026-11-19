@@ -183,6 +183,29 @@ class SchemaRetrieverTest(unittest.TestCase):
             "non_additive_median",
         )
 
+    def test_bare_household_income_is_not_assumed_to_be_median(self) -> None:
+        result = retrieve_schema(
+            "Compare population and household income in California and Texas",
+            years=[2020],
+        )
+        self.assertNotIn(
+            "median_household_income",
+            {metric["metric_id"] for metric in result["metrics"]},
+        )
+
+    def test_aggregate_household_income_uses_additive_catalog_field(self) -> None:
+        result = retrieve_schema(
+            "Compare aggregate household income in California and Texas",
+            years=[2020],
+        )
+        metric = next(
+            item
+            for item in result["metrics"]
+            if item["metric_id"] == "aggregate_household_income"
+        )
+        self.assertEqual(metric["required_columns"], ["B19025e1"])
+        self.assertEqual(metric["aggregation_semantics"], "additive_currency")
+
     def test_age_65_plus_percentage_returns_complete_field_group(self) -> None:
         result = retrieve_schema(
             "What percentage of Washington's population was age 65 or older in 2020?",
