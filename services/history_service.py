@@ -4,7 +4,7 @@ Own the JSONL chat-history schema, validation, conversion, append-only storage,
 and chat_id-based refresh merging.
 负责 JSONL 聊天历史格式、校验、消息转换、追加存储，以及基于 chat_id 的刷新合并。
 
-JSONL history format / JSONL 历史记录格式（每行一条完整问答记录）:
+JSONL history format / JSONL 历史记录格式（每行一条完成问答或异常快照）:
 {
     "chat_id": "",          # Unique chat identifier / 唯一聊天标识
     "text": "",             # User input / 用户输入
@@ -14,11 +14,13 @@ JSONL history format / JSONL 历史记录格式（每行一条完整问答记录
     "response": "",         # Empty when invalid / 无效时为空
     "response_status": 0,    # 0: completed / 完成; non-zero: pending / 待处理
     "sql": "",              # Executed SQL / 执行的 SQL
-    "sql_resp": "",         # SQL result / SQL 返回结果
+    "sql_resp": "",         # Legacy only; new records keep this empty / 仅兼容旧记录
     "intent_status": "",    # INVALID, NEW, or FOLLOW_UP / 本轮意图
     "resolution": "",       # NONE, NEEDS_CLARIFICATION, or RESOLVED_PENDING
     "pending_question": "", # Pending resolved question / 待补充的问题
     "pending_clarification": "" # Agent clarification / Agent 主动追问
+    "pipeline_stage": "",   # Last completed pipeline stage / 最后完成阶段
+    "failure_type": ""      # Technical failure classification / 技术失败类型
 }
 
 Functions / 包含函数:
@@ -26,6 +28,7 @@ Functions / 包含函数:
 - load_history_records: Load the latest JSONL records. / 读取末尾历史记录。
 - append_history_record: Append one complete record. / 追加一条完整记录。
 - find_exact_completed_record: Find a reusable exact prior answer. / 查找可复用的完全一致历史回答。
+- find_resumable_record: Find the immediately previous resumable failure. / 查找可断点续跑的上一条失败记录。
 - latest_history_activity: Parse the latest record time. / 解析最近历史记录时间。
 - build_history_record: Build a canonical record. / 构造标准记录。
 - records_to_model_messages: Convert records for Agents. / 转换为 Agent 历史消息。
@@ -53,6 +56,14 @@ INTENT_STATUS_NEW = "NEW"
 RESOLUTION_NONE = "NONE"
 RESOLUTION_NEEDS_CLARIFICATION = "NEEDS_CLARIFICATION"
 RESOLUTION_RESOLVED_PENDING = "RESOLVED_PENDING"
+PIPELINE_STAGE_RECEIVED = "RECEIVED"
+PIPELINE_STAGE_INTENT_COMPLETE = "INTENT_COMPLETE"
+PIPELINE_STAGE_SQL_COMPLETE = "SQL_COMPLETE"
+PIPELINE_STAGE_DATA_COMPLETE = "DATA_COMPLETE"
+PIPELINE_STAGE_ANSWER_COMPLETE = "ANSWER_COMPLETE"
+FAILURE_TYPE_MODEL_UNAVAILABLE = "MODEL_UNAVAILABLE"
+FAILURE_TYPE_MODEL_RATE_LIMIT = "MODEL_RATE_LIMIT"
+FAILURE_TYPE_SERVICE = "SERVICE_ERROR"
 VALID_RESOLUTIONS = {
     "",
     RESOLUTION_NONE,
@@ -72,6 +83,8 @@ STRING_FIELDS = (
     "resolution",
     "pending_question",
     "pending_clarification",
+    "pipeline_stage",
+    "failure_type",
 )
 STATUS_FIELDS = ("valid_status", "response_status")
 
@@ -109,6 +122,8 @@ def _normalize_legacy_record(
     # Old JSONL rows predate question rewriting; their original text remains usable.
     # 旧 JSONL 记录没有改写字段，读取时使用原始问题作为兼容值。
     normalized.setdefault("rewritten_question", str(normalized.get("text", "")))
+    normalized.setdefault("pipeline_stage", "")
+    normalized.setdefault("failure_type", "")
     return normalized
 
 
@@ -208,11 +223,60 @@ def find_exact_completed_record(
             and record["response_status"] == RESPONSE_STATUS_NORMAL
             and record["intent_status"] == INTENT_STATUS_NEW
             and bool(record["response"].strip())
-            and bool(record["sql_resp"].strip())
+            and (
+                record.get("pipeline_stage", "")
+                == PIPELINE_STAGE_ANSWER_COMPLETE
+                or (
+                    not record.get("pipeline_stage", "")
+                    and bool(record["sql_resp"].strip())
+                )
+            )
+            and not record.get("failure_type", "")
             and record["resolution"] != RESOLUTION_NEEDS_CLARIFICATION
         ):
             return record
     return None
+
+
+def find_resumable_record(
+    records: list[dict[str, Any]],
+    user_input: str,
+) -> dict[str, Any] | None:
+    """Return only the immediately previous matching model-timeout checkpoint.
+
+    仅允许原始问题与上一条记录完全一致，并且上一轮因模型临时不可用而失败时续跑。
+    逻辑拒绝、澄清、数据失败和更早的同名问题都不会被复用。
+    """
+    expected_text = user_input.strip()
+    if not expected_text or not records:
+        return None
+    record = records[-1]
+    if (
+        record["text"].strip() != expected_text
+        or record["valid_status"] != VALID_STATUS_VALID
+        or record["response_status"] != RESPONSE_STATUS_NORMAL
+        or record.get("failure_type", "") != FAILURE_TYPE_MODEL_UNAVAILABLE
+        or record["resolution"] == RESOLUTION_NEEDS_CLARIFICATION
+        or record.get("pipeline_stage", "") not in {
+            PIPELINE_STAGE_INTENT_COMPLETE,
+            PIPELINE_STAGE_SQL_COMPLETE,
+            PIPELINE_STAGE_DATA_COMPLETE,
+        }
+        or not record["rewritten_question"].strip()
+        or not record["intent_status"].strip()
+    ):
+        return None
+    if (
+        record.get("pipeline_stage", "") == PIPELINE_STAGE_SQL_COMPLETE
+        and not record["sql"].strip()
+    ):
+        return None
+    if (
+        record.get("pipeline_stage", "") == PIPELINE_STAGE_DATA_COMPLETE
+        and not record["sql"].strip()
+    ):
+        return None
+    return record
 
 
 def latest_history_activity(
@@ -246,6 +310,8 @@ def build_history_record(
     resolution: str = "",
     pending_question: str = "",
     pending_clarification: str = "",
+    pipeline_stage: str = "",
+    failure_type: str = "",
 ) -> dict[str, Any]:
     """Build a canonical history record. / 构造一条标准历史记录。"""
     record = {
@@ -262,6 +328,8 @@ def build_history_record(
         "resolution": resolution,
         "pending_question": pending_question,
         "pending_clarification": pending_clarification,
+        "pipeline_stage": pipeline_stage,
+        "failure_type": failure_type,
     }
     if not _is_valid_record(record):
         raise ValueError("Cannot build an invalid chat history record.")
@@ -282,6 +350,11 @@ def _records_to_messages(
         # pending 记录没有最终回复，仅用于临时内存状态，不应重新显示或传给 Agent；
         # 这也会过滤旧版本曾写入 JSONL 的失败 pending 记录。
         if record["response_status"] == RESPONSE_STATUS_PENDING:
+            continue
+        if use_rewritten_question and record.get("failure_type"):
+            # Technical failure text is useful in the UI but is not factual
+            # conversation context and must not influence a later Agent turn.
+            # 技术错误文案仅用于页面展示，不应作为事实历史传给后续 Agent。
             continue
 
         user_content = (

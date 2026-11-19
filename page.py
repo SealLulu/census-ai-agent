@@ -74,6 +74,11 @@ def chat(
         if not pending_list
         else None
     )
+    resumable_record = (
+        history_service.find_resumable_record(history_records, user_input)
+        if cached_record is None
+        else None
+    )
     if cached_record is not None:
         pending_list.clear()
         final_record = history_service.build_history_record(
@@ -83,9 +88,10 @@ def chat(
             rewritten_question=cached_record["rewritten_question"],
             response=cached_record["response"],
             sql=cached_record["sql"],
-            sql_resp=cached_record["sql_resp"],
+            sql_resp="",
             intent_status=history_service.INTENT_STATUS_NEW,
             resolution=history_service.RESOLUTION_NONE,
+            pipeline_stage=history_service.PIPELINE_STAGE_ANSWER_COMPLETE,
         )
         history_service.append_history_record(username, final_record)
         history_records.append(final_record)
@@ -95,6 +101,13 @@ def chat(
 
     active_chat_ids.add(chat_id)
     latest_pending = pending_list[-1] if pending_list else {}
+    checkpoint: dict[str, str] = {
+        "pipeline_stage": history_service.PIPELINE_STAGE_RECEIVED,
+        "rewritten_question": user_input,
+        "intent_status": "",
+        "resolution": "",
+        "sql": "",
+    }
 
     # Keep a pending in-memory record so a timed refresh can identify this chat
     # and preserve it by chat_id until the final record reaches disk.
@@ -108,6 +121,7 @@ def chat(
         pending_clarification=latest_pending.get(
             "pending_clarification", ""
         ),
+        pipeline_stage=history_service.PIPELINE_STAGE_RECEIVED,
     )
     history_records.append(pending_record)
 
@@ -125,6 +139,16 @@ def chat(
         else:
             progress_bar.progress(percent, text=progress_text)
 
+    def update_checkpoint(values: dict[str, str]) -> None:
+        """Keep every completed pipeline value for final/failure persistence. / 保存阶段值。"""
+        checkpoint.update(
+            {
+                key: value
+                for key, value in values.items()
+                if key in checkpoint and isinstance(value, str)
+            }
+        )
+
     try:
         history_messages = history_service.records_to_model_messages(
             history_records[:-1]
@@ -136,6 +160,8 @@ def chat(
             pending_list=pending_list,
             snowflake_config=snowflake_config,
             progress_callback=render_progress,
+            checkpoint_callback=update_checkpoint,
+            resume_state=resumable_record,
         )
 
         # Resolution is the single source of truth for clarification state.
@@ -194,6 +220,7 @@ def chat(
                 resolution=flow_result.resolution,
                 pending_question=pending_question,
                 pending_clarification=pending_clarification,
+                pipeline_stage=checkpoint["pipeline_stage"],
             )
             with st.chat_message("assistant"):
                 st.markdown(history_service.INVALID_RESPONSE_TEXT)
@@ -209,11 +236,12 @@ def chat(
                 rewritten_question=flow_result.rewritten_question,
                 response=flow_result.direct_response,
                 sql=flow_result.sql,
-                sql_resp=flow_result.sql_response,
+                sql_resp="",
                 intent_status=flow_result.intent_status,
                 resolution=flow_result.resolution,
                 pending_question=pending_question,
                 pending_clarification=pending_clarification,
+                pipeline_stage=checkpoint["pipeline_stage"],
             )
         else:
             if flow_result.answer_stream is None:
@@ -231,11 +259,12 @@ def chat(
                 rewritten_question=flow_result.rewritten_question,
                 response=str(response),
                 sql=flow_result.sql,
-                sql_resp=flow_result.sql_response,
+                sql_resp="",
                 intent_status=flow_result.intent_status,
                 resolution=flow_result.resolution,
                 pending_question=pending_question,
                 pending_clarification=pending_clarification,
+                pipeline_stage=history_service.PIPELINE_STAGE_ANSWER_COMPLETE,
             )
 
         history_service.append_history_record(username, final_record)
@@ -249,12 +278,27 @@ def chat(
         # failed user question from appearing twice after a timed refresh.
         # 从页面视角看，技术异常已经产生了最终回复。这里保存服务异常文案而不是
         # 内存 pending 记录，并让调用方重绘页面，避免定时刷新后重复显示当前问题。
-        LOGGER.exception(
-            "Chat processing failed for user=%s chat_id=%s",
-            username,
-            chat_id,
-        )
+        if isinstance(error, (LLMUnavailableError, LLMRateLimitError)):
+            LOGGER.warning(
+                "Handled model failure for user=%s chat_id=%s stage=%s type=%s",
+                username,
+                chat_id,
+                checkpoint["pipeline_stage"],
+                type(error).__name__,
+            )
+        else:
+            LOGGER.exception(
+                "Chat processing failed for user=%s chat_id=%s",
+                username,
+                chat_id,
+            )
         error_response_text = _error_response_text(error)
+        if isinstance(error, LLMUnavailableError):
+            failure_type = history_service.FAILURE_TYPE_MODEL_UNAVAILABLE
+        elif isinstance(error, LLMRateLimitError):
+            failure_type = history_service.FAILURE_TYPE_MODEL_RATE_LIMIT
+        else:
+            failure_type = history_service.FAILURE_TYPE_SERVICE
         latest_pending = pending_list[-1] if pending_list else {}
         failed_record = history_service.build_history_record(
             chat_id=chat_id,
@@ -262,10 +306,17 @@ def chat(
             valid_status=history_service.VALID_STATUS_VALID,
             response=error_response_text,
             response_status=history_service.RESPONSE_STATUS_NORMAL,
+            rewritten_question=checkpoint["rewritten_question"],
+            sql=checkpoint["sql"],
+            sql_resp="",
+            intent_status=checkpoint["intent_status"],
+            resolution=checkpoint["resolution"],
             pending_question=latest_pending.get("pending_question", ""),
             pending_clarification=latest_pending.get(
                 "pending_clarification", ""
             ),
+            pipeline_stage=checkpoint["pipeline_stage"],
+            failure_type=failure_type,
         )
         history_records[-1] = failed_record
         try:
