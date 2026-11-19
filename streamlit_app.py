@@ -20,7 +20,7 @@ import logging
 import streamlit as st
 
 from cold_start import AppConfig, initialize_application
-from logger import setup_logger
+from services.logging_service import setup_logger
 from page import chat, load_history
 from services.history_service import (
     get_pending_list,

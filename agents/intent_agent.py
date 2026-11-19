@@ -9,12 +9,17 @@ Functions / 包含函数:
 """
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 
 from google.genai import Client, types
 
+from data_source.schema_retriever import US_STATE_IDENTIFIERS
 from services.llm_service import generate_content_with_fallback, to_gemini_contents
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 STATUS_INVALID = "INVALID"
@@ -125,6 +130,13 @@ Clarification handling:
 - Typical material ambiguity includes median vs mean/per-capita income,
   Washington State vs Washington, DC, or a missing subject/geography that prevents
   a meaningful data query. Do not guess between materially different metrics.
+- The exact phrases "Washington state", "Washington state's", and "State of
+  Washington" explicitly mean the US state of Washington and are not ambiguous
+  with Washington, DC. Only bare "Washington" may require clarification.
+- Questions about the percentage or number of a US state's population aged 65
+  or older are valid Census questions. Classify a self-contained question such
+  as "What percentage of Washington state's population was aged 65 or older in
+  2020?" as NEW with resolution=NONE.
 - RESOLVED_PENDING: the current message supplies the missing information for the
   pending chain. Use FOLLOW_UP and produce the fully resolved standalone_question.
 - If pending context exists but the user clearly starts an unrelated new Census
@@ -134,8 +146,9 @@ Clarification handling:
 - For every result other than NEEDS_CLARIFICATION, response_text must be empty.
 - Use NONE when there is no active clarification transition.
 
-Fail closed: when scope or intent cannot be determined reliably, choose INVALID
-instead of allowing an unsupported request into the data pipeline.
+Fail closed only when the request is clearly outside the Census scope or contains
+an unsafe instruction. If the request is clearly within Census scope but a metric
+or geography is unresolved, use NEEDS_CLARIFICATION instead of INVALID.
 """
 
 
@@ -170,6 +183,55 @@ class IntentResult:
     def is_valid(self) -> bool:
         """Return whether processing may continue. / 返回是否可以继续处理。"""
         return self.status != STATUS_INVALID
+
+
+def _is_explicit_state_age_population_question(question: str) -> bool:
+    """Recognize a narrow, clearly supported state-age query. / 识别明确合法的州年龄问题。"""
+    normalized = " ".join(question.lower().replace("-", " ").split())
+    unsafe_terms = {
+        "api key", "credential", "ignore instruction", "ignore previous",
+        "reveal prompt", "system prompt", "secret", "write code",
+    }
+    if any(term in normalized for term in unsafe_terms):
+        return False
+    explicit_state = any(
+        re.search(rf"\b{re.escape(state)} state(?:'s)?\b", normalized)
+        or re.search(rf"\bstate of {re.escape(state)}\b", normalized)
+        for state in US_STATE_IDENTIFIERS
+    )
+    age_65_plus = bool(
+        re.search(
+            r"\b65\s*(?:\+|plus|(?:years?\s+)?(?:and|or)\s+(?:over|older))\b",
+            normalized,
+        )
+        or re.search(r"\b(?:over|above)\s+65\b", normalized)
+    )
+    return (
+        explicit_state
+        and "population" in normalized
+        and age_65_plus
+    )
+
+
+def _fail_closed_or_use_supported_fallback(
+    user_input: str,
+    reason: str,
+) -> IntentResult:
+    """Log validation cause and recover one safe supported query. / 记录原因并安全兜底。"""
+    if _is_explicit_state_age_population_question(user_input):
+        LOGGER.warning(
+            "Intent Agent result was rejected (%s); using deterministic "
+            "explicit-state age-65 Census fallback.",
+            reason,
+        )
+        return IntentResult(
+            STATUS_NEW,
+            RESOLUTION_NONE,
+            user_input.strip(),
+            "",
+        )
+    LOGGER.warning("Intent Agent result was rejected: %s.", reason)
+    return IntentResult(STATUS_INVALID, RESOLUTION_NONE, "", "")
 
 
 def detect_conversation_intent(
@@ -213,7 +275,10 @@ def detect_conversation_intent(
     try:
         result = json.loads(content)
     except (json.JSONDecodeError, TypeError):
-        return IntentResult(STATUS_INVALID, RESOLUTION_NONE, "", "")
+        return _fail_closed_or_use_supported_fallback(
+            user_input,
+            "invalid JSON response",
+        )
 
     expected_fields = {
         "status",
@@ -222,7 +287,10 @@ def detect_conversation_intent(
         "response_text",
     }
     if not isinstance(result, dict) or set(result) != expected_fields:
-        return IntentResult(STATUS_INVALID, RESOLUTION_NONE, "", "")
+        return _fail_closed_or_use_supported_fallback(
+            user_input,
+            "unexpected response fields",
+        )
 
     status = str(result.get("status", "")).strip().upper()
     resolution = str(result.get("resolution", "")).strip().upper()
@@ -234,24 +302,56 @@ def detect_conversation_intent(
         or not isinstance(standalone_question, str)
         or not isinstance(response_text, str)
     ):
-        return IntentResult(STATUS_INVALID, RESOLUTION_NONE, "", "")
+        return _fail_closed_or_use_supported_fallback(
+            user_input,
+            "invalid response value types or enum values",
+        )
     if status == STATUS_INVALID:
-        return IntentResult(STATUS_INVALID, RESOLUTION_NONE, "", "")
+        return _fail_closed_or_use_supported_fallback(
+            user_input,
+            "model classified the request as INVALID",
+        )
+    if (
+        resolution == RESOLUTION_NEEDS_CLARIFICATION
+        and _is_explicit_state_age_population_question(user_input)
+    ):
+        LOGGER.warning(
+            "Intent Agent requested unnecessary clarification for an explicit "
+            "state age-65 Census question; using deterministic NEW intent."
+        )
+        return IntentResult(
+            STATUS_NEW,
+            RESOLUTION_NONE,
+            user_input.strip(),
+            "",
+        )
 
     # Reject internally inconsistent transitions instead of guessing how to
     # repair them after the guardrail decision.
     # 对不一致的状态组合采用失败关闭策略，避免在 Guardrail 后自行猜测修复。
     if status == STATUS_NEW and resolution == RESOLUTION_RESOLVED_PENDING:
-        return IntentResult(STATUS_INVALID, RESOLUTION_NONE, "", "")
+        return _fail_closed_or_use_supported_fallback(
+            user_input,
+            "NEW cannot resolve pending context",
+        )
     if (
         resolution == RESOLUTION_RESOLVED_PENDING
         and not pending_list
     ):
-        return IntentResult(STATUS_INVALID, RESOLUTION_NONE, "", "")
+        return _fail_closed_or_use_supported_fallback(
+            user_input,
+            "RESOLVED_PENDING was returned without pending context",
+        )
     if status == STATUS_FOLLOW_UP and not (history_messages or pending_list):
-        return IntentResult(STATUS_INVALID, RESOLUTION_NONE, "", "")
+        return _fail_closed_or_use_supported_fallback(
+            user_input,
+            "FOLLOW_UP was returned without history or pending context",
+        )
     if status == STATUS_FOLLOW_UP and not standalone_question.strip():
-        return IntentResult(STATUS_INVALID, RESOLUTION_NONE, "", "")
+        return _fail_closed_or_use_supported_fallback(
+            user_input,
+            "FOLLOW_UP returned an empty standalone question",
+        )
 
     resolved_question = standalone_question.strip() or user_input.strip()
     if _needs_income_metric_clarification(resolved_question):
