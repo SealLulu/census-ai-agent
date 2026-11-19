@@ -10,15 +10,27 @@ Open the deployed application at:
 
 <https://census-0blxamkqja9census-ai-agent.streamlit.app/>
 
-1. Enter the GitHub username supplied for evaluation and select **Login**.
+1. Enter the GitHub username supplied for evaluation in the **Username** field
+   and select **Login**. Alternatively, use `Demo` as the shared evaluation
+   username. No password is required.
+
+   **Important: Usernames are case-sensitive. Enter the username with its exact capitalization.**
+
 2. After login, enter a US Census question in the chat input. Follow-up
    questions may refer to the previous conversation context.
 3. Use **Log out** before closing the application when possible so the current
    username Session is released immediately.
 
-The hosted deployment reads `ALLOWED_USERS` from private Streamlit Secrets.
-Therefore, the web login uses the configured GitHub username and does not read
-the username from `startup/local_config.toml`. Username matching is exact.
+> **Demo account tip:** Enter `Demo` exactly as shown. `Demo` shares one chat
+> history among all reviewers, and the current
+> single-instance deployment allows only one browser Session for the same
+> username at a time. If `Demo` is already in use, wait for the active user to
+> log out or for the inactive Session to expire before trying again. Do not
+> enter private or sensitive information.
+
+The hosted deployment reads `ALLOWED_USERS` from private Streamlit Secrets and
+does not read the username from `startup/local_config.toml`. Username matching
+is exact and case-sensitive.
 
 ### Local application
 
