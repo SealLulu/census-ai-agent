@@ -25,6 +25,9 @@ CHAT_STATUS_VALID = 0
 CHAT_STATUS_INVALID = -1
 ProgressCallback = Callable[[int, str], None]
 LOGGER = logging.getLogger(__name__)
+DATA_QUERY_ERROR_TEXT = (
+    "The Census data query failed. Please try again later."
+)
 
 
 @dataclass(frozen=True)
@@ -160,11 +163,26 @@ def run_chat_flow(
 
     # Step 4: validation occurs inside the connector before Snowflake execution.
     # 第四步：Connector 在执行 Snowflake SQL 前完成校验。
-    data_input = census_data_service.query_census_data(
-        generated_sql.sql,
-        snowflake_config,
-        schema_context,
-    )
+    try:
+        data_input = census_data_service.query_census_data(
+            generated_sql.sql,
+            snowflake_config,
+            schema_context,
+        )
+    except census_data_service.CensusDataQueryError:
+        # Keep connector details in server logs while returning a concise,
+        # user-friendly message without exposing SQL or credentials.
+        # 服务端日志保留完整异常；页面仅返回友好提示，不暴露 SQL 或认证信息。
+        LOGGER.exception("Census data query failed.")
+        return ChatFlowResult(
+            status=CHAT_STATUS_VALID,
+            intent_status=intent_result.status,
+            sql=generated_sql.sql,
+            sql_response="",
+            resolution=intent_result.resolution,
+            rewritten_question=intent_result.standalone_question,
+            direct_response=DATA_QUERY_ERROR_TEXT,
+        )
     if progress_callback:
         progress_callback(60, "Census data ready")
 

@@ -161,6 +161,8 @@ def chat(
                 valid_status=flow_result.status,
                 rewritten_question=flow_result.rewritten_question,
                 response=flow_result.direct_response,
+                sql=flow_result.sql,
+                sql_resp=flow_result.sql_response,
                 intent_status=flow_result.intent_status,
                 resolution=flow_result.resolution,
                 pending_question=pending_question,

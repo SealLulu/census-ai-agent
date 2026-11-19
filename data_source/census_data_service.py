@@ -10,9 +10,11 @@ Functions / 包含函数:
 """
 
 import json
+import logging
 from typing import Any
 
 import snowflake.connector
+from snowflake.connector.errors import Error as SnowflakeError
 
 from cold_start import SnowflakeConfig
 from data_source.sql_validator import validate_sql
@@ -23,6 +25,14 @@ DATASET_NAME = "US Open Census Data & Neighborhood Insights - Free Dataset"
 QUERY_TIMEOUT_SECONDS = 30
 CONNECTION_TIMEOUT_SECONDS = 10
 MAX_RESULT_ROWS = 1000
+LOGGER = logging.getLogger(__name__)
+# Keep successful SQL execution logs visible in local and Streamlit deployments.
+# 确保本地及 Streamlit 部署环境都能看到正常执行的 SQL 日志。
+LOGGER.setLevel(logging.INFO)
+
+
+class CensusDataQueryError(RuntimeError):
+    """Represent a safe-to-handle Census query failure. / 表示可安全处理的数据查询失败。"""
 
 
 def _column_name(description: Any) -> str:
@@ -46,7 +56,9 @@ def query_census_data(
         schema_name=config.schema,
     )
     if not validation.is_valid:
-        raise ValueError("SQL validation failed: " + "; ".join(validation.errors))
+        raise CensusDataQueryError(
+            "SQL validation failed: " + "; ".join(validation.errors)
+        )
 
     connection_parameters: dict[str, Any] = {
         "account": config.account,
@@ -79,11 +91,18 @@ def query_census_data(
     else:
         connection_parameters["password"] = config.password
 
-    connection = snowflake.connector.connect(
-        **connection_parameters,
-    )
+    connection = None
     cursor = None
     try:
+        # Log only the validated, normalized SQL. Never log credentials or rows.
+        # 仅记录校验并规范化后的 SQL，不记录认证信息或查询结果。
+        LOGGER.info(
+            "Executing Snowflake SQL:\n%s",
+            validation.normalized_sql,
+        )
+        connection = snowflake.connector.connect(
+            **connection_parameters,
+        )
         cursor = connection.cursor()
         cursor.execute(
             validation.normalized_sql,
@@ -108,7 +127,21 @@ def query_census_data(
             ensure_ascii=False,
             default=str,
         )
+    except SnowflakeError as error:
+        raise CensusDataQueryError(
+            "Snowflake could not complete the Census data query."
+        ) from error
     finally:
         if cursor is not None:
-            cursor.close()
-        connection.close()
+            try:
+                cursor.close()
+            except SnowflakeError:
+                LOGGER.warning("Unable to close the Snowflake cursor.", exc_info=True)
+        if connection is not None:
+            try:
+                connection.close()
+            except SnowflakeError:
+                LOGGER.warning(
+                    "Unable to close the Snowflake connection.",
+                    exc_info=True,
+                )
