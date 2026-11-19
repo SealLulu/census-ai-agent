@@ -10,6 +10,8 @@ Functions / 包含函数:
 """
 
 import logging
+import re
+import time
 from collections.abc import Iterator
 from typing import Any
 
@@ -21,6 +23,7 @@ GEMINI_MODEL_NAME = "gemini-3.5-flash-lite"
 GEMINI_FALLBACK_MODEL_NAME = "gemini-3.6-flash"
 GEMINI_MODEL_CANDIDATES = (GEMINI_MODEL_NAME, GEMINI_FALLBACK_MODEL_NAME)
 GEMINI_REQUEST_TIMEOUT_MS = 15_000
+MAX_QUOTA_RETRY_SECONDS = 15.0
 FALLBACK_STATUS_CODES = {404, 408, 429, 500, 502, 503, 504}
 LOGGER = logging.getLogger(__name__)
 
@@ -54,6 +57,32 @@ def _can_fallback(error: Exception) -> bool:
     }
 
 
+def _quota_retry_delay(error: Exception) -> float | None:
+    """Read Gemini RetryInfo for a bounded 429 retry. / 读取 429 的有限重试时间。"""
+    if not isinstance(error, errors.APIError):
+        return None
+    try:
+        if int(error.code) != 429:
+            return None
+    except (TypeError, ValueError):
+        return None
+
+    details = error.details if isinstance(error.details, dict) else {}
+    payload = details.get("error", details)
+    retry_details = payload.get("details", []) if isinstance(payload, dict) else []
+    for detail in retry_details:
+        if not isinstance(detail, dict):
+            continue
+        if not str(detail.get("@type", "")).endswith("RetryInfo"):
+            continue
+        match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)s", str(detail.get("retryDelay", "")))
+        if match:
+            delay = float(match.group(1))
+            if 0 < delay <= MAX_QUOTA_RETRY_SECONDS:
+                return delay
+    return None
+
+
 def generate_content_with_fallback(
     client: genai.Client,
     *,
@@ -62,20 +91,34 @@ def generate_content_with_fallback(
 ) -> Any:
     """Generate a complete response with fallback. / 使用主模型和备用模型生成完整响应。"""
     for index, model_name in enumerate(GEMINI_MODEL_CANDIDATES):
-        try:
-            return client.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=config,
-            )
-        except Exception as error:
-            is_last = index == len(GEMINI_MODEL_CANDIDATES) - 1
-            if is_last or not _can_fallback(error):
-                raise
-            LOGGER.warning(
-                "Gemini model %s failed temporarily; using fallback model.",
-                model_name,
-            )
+        quota_retried = False
+        while True:
+            try:
+                return client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=config,
+                )
+            except Exception as error:
+                retry_delay = _quota_retry_delay(error)
+                if retry_delay is not None and not quota_retried:
+                    quota_retried = True
+                    LOGGER.warning(
+                        "Gemini model %s reached a temporary quota limit; "
+                        "retrying once in %.1f seconds.",
+                        model_name,
+                        retry_delay,
+                    )
+                    time.sleep(retry_delay)
+                    continue
+                is_last = index == len(GEMINI_MODEL_CANDIDATES) - 1
+                if is_last or not _can_fallback(error):
+                    raise
+                LOGGER.warning(
+                    "Gemini model %s failed temporarily; using fallback model.",
+                    model_name,
+                )
+                break
     raise RuntimeError("No Gemini model candidate was available.")
 
 
@@ -88,24 +131,42 @@ def stream_content_with_fallback(
     """Fallback only before the first streamed chunk. / 仅在首个流式分片前切换模型。"""
     for index, model_name in enumerate(GEMINI_MODEL_CANDIDATES):
         emitted = False
-        try:
-            for chunk in client.models.generate_content_stream(
-                model=model_name,
-                contents=contents,
-                config=config,
-            ):
-                if chunk.text:
-                    emitted = True
-                    yield chunk.text
-            return
-        except Exception as error:
-            is_last = index == len(GEMINI_MODEL_CANDIDATES) - 1
-            if emitted or is_last or not _can_fallback(error):
-                raise
-            LOGGER.warning(
-                "Gemini stream %s failed before output; using fallback model.",
-                model_name,
-            )
+        quota_retried = False
+        while True:
+            try:
+                for chunk in client.models.generate_content_stream(
+                    model=model_name,
+                    contents=contents,
+                    config=config,
+                ):
+                    if chunk.text:
+                        emitted = True
+                        yield chunk.text
+                return
+            except Exception as error:
+                retry_delay = _quota_retry_delay(error)
+                if (
+                    not emitted
+                    and retry_delay is not None
+                    and not quota_retried
+                ):
+                    quota_retried = True
+                    LOGGER.warning(
+                        "Gemini stream %s reached a temporary quota limit; "
+                        "retrying once in %.1f seconds.",
+                        model_name,
+                        retry_delay,
+                    )
+                    time.sleep(retry_delay)
+                    continue
+                is_last = index == len(GEMINI_MODEL_CANDIDATES) - 1
+                if emitted or is_last or not _can_fallback(error):
+                    raise
+                LOGGER.warning(
+                    "Gemini stream %s failed before output; using fallback model.",
+                    model_name,
+                )
+                break
     raise RuntimeError("No Gemini streaming model candidate was available.")
 
 

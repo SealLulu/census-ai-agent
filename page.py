@@ -193,27 +193,47 @@ def chat(
         history_records[-1] = final_record
         return final_record
     except Exception:
-        # A failed request remains pending on disk for later recovery/retry logic.
-        # 失败请求以 pending 状态保存，方便后续增加恢复或重试逻辑。
+        # A technical failure is a completed interaction from the UI's point of
+        # view. Persist the service-error response instead of the in-memory
+        # pending record, then let the caller rerun the page. This removes the
+        # live bubble before history renders the same chat_id and prevents the
+        # failed user question from appearing twice after a timed refresh.
+        # 从页面视角看，技术异常已经产生了最终回复。这里保存服务异常文案而不是
+        # 内存 pending 记录，并让调用方重绘页面，避免定时刷新后重复显示当前问题。
         LOGGER.exception(
             "Chat processing failed for user=%s chat_id=%s",
             username,
             chat_id,
         )
+        latest_pending = pending_list[-1] if pending_list else {}
+        failed_record = history_service.build_history_record(
+            chat_id=chat_id,
+            user_input=user_input,
+            valid_status=history_service.VALID_STATUS_VALID,
+            response=SERVICE_ERROR_TEXT,
+            response_status=history_service.RESPONSE_STATUS_NORMAL,
+            pending_question=latest_pending.get("pending_question", ""),
+            pending_clarification=latest_pending.get(
+                "pending_clarification", ""
+            ),
+        )
+        history_records[-1] = failed_record
         try:
-            history_service.append_history_record(username, pending_record)
+            history_service.append_history_record(username, failed_record)
         except (OSError, ValueError):
             LOGGER.exception(
-                "Unable to save pending chat for user=%s chat_id=%s",
+                "Unable to save failed chat for user=%s chat_id=%s",
                 username,
                 chat_id,
             )
+            # Keep the current live user/error bubbles when persistence fails.
+            # 落盘失败时保留当前页面上的用户问题和错误回复。
+            with st.chat_message("assistant"):
+                st.markdown(SERVICE_ERROR_TEXT)
+            return None
         with st.chat_message("assistant"):
             st.markdown(SERVICE_ERROR_TEXT)
-        # Returning None prevents the caller from immediately rerunning and
-        # clearing the transient service-error message from the current page.
-        # 返回 None 可避免调用方立即重跑，导致当前页面上的服务异常提示被清除。
-        return None
+        return failed_record
     finally:
         if progress_bar is not None:
             progress_bar.empty()

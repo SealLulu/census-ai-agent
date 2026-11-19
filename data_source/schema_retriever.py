@@ -208,14 +208,17 @@ def _retrieve_related_table_columns(
     relationships: list[dict[str, Any]],
 ) -> dict[str, list[dict[str, Any]]]:
     """Load columns for relationship target tables. / 读取关系目标表字段。"""
+    # Matched source tables are already represented by the ranked `columns`
+    # result. Loading every column from those wide Census tables can expand a
+    # small retrieval result into more than a million JSON characters and
+    # exhaust the LLM input-token quota. Only relationship targets add new
+    # schema context needed to follow a JOIN path.
+    # 已命中的源表字段已包含在 columns 中。再次加载这些 Census 宽表的全部字段会让
+    # Schema JSON 膨胀到百万字符并耗尽模型输入额度，因此这里只补充关联目标表。
     table_names = sorted(
         {
-            table_name
+            relationship["target_table"]
             for relationship in relationships
-            for table_name in (
-                relationship["source_table"],
-                relationship["target_table"],
-            )
         }
     )
     if not table_names:

@@ -45,7 +45,7 @@ VALID_STATUS_VALID = 0
 VALID_STATUS_INVALID = -1
 RESPONSE_STATUS_NORMAL = 0
 RESPONSE_STATUS_PENDING = 1
-INVALID_RESPONSE_TEXT = "I cannot answer that question."
+INVALID_RESPONSE_TEXT = "I can only answer questions related to U.S. Census data, such as population, demographics, income, and housing."
 MAX_PENDING_ITEMS = 5
 INTENT_STATUS_NEW = "NEW"
 RESOLUTION_NONE = "NONE"
@@ -229,6 +229,15 @@ def _records_to_messages(
     """Convert records with the selected user-question source. / 按指定问题字段转换消息。"""
     messages: list[dict[str, str]] = []
     for record in records:
+        # Pending records have no final assistant response. They are kept only
+        # as transient in-memory state and must not be replayed into the UI or
+        # Agent context. This also hides legacy failed requests that older
+        # versions wrote to JSONL as pending rows.
+        # pending 记录没有最终回复，仅用于临时内存状态，不应重新显示或传给 Agent；
+        # 这也会过滤旧版本曾写入 JSONL 的失败 pending 记录。
+        if record["response_status"] == RESPONSE_STATUS_PENDING:
+            continue
+
         user_content = (
             record.get("rewritten_question") or record["text"]
             if use_rewritten_question
@@ -246,8 +255,6 @@ def _records_to_messages(
             messages.append(
                 {"role": "assistant", "content": record["response"]}
             )
-        # Pending records intentionally display only the user input.
-        # pending 记录当前只显示用户输入。
     return messages
 
 

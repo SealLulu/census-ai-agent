@@ -9,6 +9,18 @@ not added or removed here.
 
 ## Conversation and Agent Intelligence / 对话与 Agent 能力
 
+- Improve the production model and context budget. The current implementation
+  already uses local Schema Retrieval to filter part of the Catalog, reduce
+  context usage, and help each Agent focus on the current task. However, the
+  deployed free model has a limited context and quota, so retrieval breadth—and
+  therefore some answer accuracy—is intentionally sacrificed to keep the full
+  process reliable and able to complete. A future higher-capacity model should
+  restore broader Schema context and improve accuracy without breaking latency.
+  / 提升生产模型及其上下文额度。当前实现已通过本地 Schema Retrieval 过滤部分
+  Catalog 内容，以节省上下文并帮助 Agent 聚焦当前任务。但由于部署使用免费模型，
+  上下文和额度受限，目前只能适当牺牲检索范围及部分回答精度，优先保证完整流程能够
+  稳定运行并正常结束；后续应使用容量更高的模型，在不破坏延迟目标的前提下恢复更广
+  的 Schema 上下文并提高准确性。
 - Introduce LangGraph or another explicit state graph when the workflow requires
   more agents, branching, retries, or human approval.
 - Expand pending clarification into typed states for geography, metric, year, and

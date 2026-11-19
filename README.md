@@ -182,7 +182,7 @@ Each line uses this format:
 - `text`: the original user input displayed in the chat UI.
 - `rewritten_question`: the standalone question produced by the Intent Agent and used for Agent history, Schema Retrieval, Text-to-SQL, and answer generation. Legacy rows fall back to `text`.
 - `valid_status`: `0` means valid; `-1` means invalid. Invalid records keep `response` empty and the page displays `I cannot answer that question.`
-- `response_status`: `0` means normal/completed; a non-zero value means the technical execution is still processing or failed before completion. Such records currently display only the user question; this is separate from semantic clarification state.
+- `response_status`: `0` means completed; a non-zero value is reserved for an in-memory request that is still processing. If model processing fails, the English service-error response is stored as a completed record so history refreshes do not duplicate a user-only pending question. This is separate from semantic clarification state.
 - `intent_status`: stores `INVALID`, `NEW`, or `FOLLOW_UP`, allowing history reloads to truncate the pending chain at a `NEW` boundary.
 - `resolution`: stores `NONE`, `NEEDS_CLARIFICATION`, or `RESOLVED_PENDING`. `FOLLOW_UP` controls whether answer generation receives recent history; `NEEDS_CLARIFICATION` ends the current pipeline immediately and returns the Intent Agent's clarification question.
 - `sql` and `sql_resp` are reserved for the Census data-source workflow.
