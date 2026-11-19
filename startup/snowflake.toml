@@ -1,8 +1,8 @@
 [SNOWFLAKE]
 auth_method = "PROGRAMMATIC_ACCESS_TOKEN"
-account = "YOUR-ACCOUNT"
+account = "YOUR_ACCOUNT"
 token = "YOUR-TOKEN"
 warehouse = "COMPUTE_WH"
 schema = "PUBLIC"
 database = "US_OPEN_CENSUS_DATA_NEIGHBORHOOD_INSIGHTS_FREE_DATASET"
-user = "YOUR-USER_NAME"
+user = "YOUR-USERNAME"
