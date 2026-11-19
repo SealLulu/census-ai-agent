@@ -17,14 +17,30 @@ import streamlit as st
 from google.genai import Client
 
 import chat as chat_workflow
+import services.history_service as history_service
 from cold_start import SnowflakeConfig
-from services import history_service
+from services.llm_service import LLMRateLimitError, LLMUnavailableError
 
 
 LOGGER = logging.getLogger(__name__)
 SERVICE_ERROR_TEXT = (
     "The service is currently unavailable. Please try again later."
 )
+MODEL_BUSY_ERROR_TEXT = (
+    "The AI model is temporarily busy. Please wait a moment and try again."
+)
+MODEL_LIMIT_ERROR_TEXT = (
+    "The AI model usage limit has been reached. Please wait and try again later."
+)
+
+
+def _error_response_text(error: Exception) -> str:
+    """Select a safe user-facing failure message. / 选择安全的用户错误提示。"""
+    if isinstance(error, LLMRateLimitError):
+        return MODEL_LIMIT_ERROR_TEXT
+    if isinstance(error, LLMUnavailableError):
+        return MODEL_BUSY_ERROR_TEXT
+    return SERVICE_ERROR_TEXT
 
 
 def load_history(username: str, load_limit: int) -> list[dict[str, Any]]:
@@ -194,7 +210,7 @@ def chat(
         history_service.append_history_record(username, final_record)
         history_records[-1] = final_record
         return final_record
-    except Exception:
+    except Exception as error:
         # A technical failure is a completed interaction from the UI's point of
         # view. Persist the service-error response instead of the in-memory
         # pending record, then let the caller rerun the page. This removes the
@@ -207,12 +223,13 @@ def chat(
             username,
             chat_id,
         )
+        error_response_text = _error_response_text(error)
         latest_pending = pending_list[-1] if pending_list else {}
         failed_record = history_service.build_history_record(
             chat_id=chat_id,
             user_input=user_input,
             valid_status=history_service.VALID_STATUS_VALID,
-            response=SERVICE_ERROR_TEXT,
+            response=error_response_text,
             response_status=history_service.RESPONSE_STATUS_NORMAL,
             pending_question=latest_pending.get("pending_question", ""),
             pending_clarification=latest_pending.get(
@@ -231,10 +248,10 @@ def chat(
             # Keep the current live user/error bubbles when persistence fails.
             # 落盘失败时保留当前页面上的用户问题和错误回复。
             with st.chat_message("assistant"):
-                st.markdown(SERVICE_ERROR_TEXT)
+                st.markdown(error_response_text)
             return None
         with st.chat_message("assistant"):
-            st.markdown(SERVICE_ERROR_TEXT)
+            st.markdown(error_response_text)
         return failed_record
     finally:
         if progress_bar is not None:

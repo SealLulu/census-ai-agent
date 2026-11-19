@@ -82,6 +82,8 @@ python -m data_source.test.test_sql_agent
 
 Before Snowflake execution, `data_source.sql_validator.validate_sql` parses the statement with the Snowflake dialect and rejects multiple statements, non-SELECT operations, wildcard fields, unqualified or unrecognized tables, columns outside the retrieved context, unverified joins, and missing or excessive limits. `data_source.census_data_service.query_census_data` validates again, logs the normalized SQL immediately before the Snowflake call, uses the configured read-only role, applies connection and 30-second statement timeouts, and returns at most 1,000 rows. Credentials and returned rows are never written to this SQL log. Validation, connection, timeout, and execution failures are logged with their technical details, while the chat page returns the user-friendly English message `The Census data query failed. Please try again later.` without exposing SQL or credentials.
 
+Gemini failures are also degraded gracefully after bounded fallback and retry attempts. A temporary `503` or timeout displays `The AI model is temporarily busy. Please wait a moment and try again.` A `429` quota or rate-limit response displays `The AI model usage limit has been reached. Please wait and try again later.` Technical details remain in server logs, and the displayed message is stored as the completed chat response.
+
 After configuring a valid API key and all Snowflake credentials, run the manual end-to-end test:
 
 ```powershell

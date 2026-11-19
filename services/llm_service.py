@@ -24,8 +24,22 @@ GEMINI_FALLBACK_MODEL_NAME = "gemini-3.6-flash"
 GEMINI_MODEL_CANDIDATES = (GEMINI_MODEL_NAME, GEMINI_FALLBACK_MODEL_NAME)
 GEMINI_REQUEST_TIMEOUT_MS = 15_000
 MAX_QUOTA_RETRY_SECONDS = 15.0
+TRANSIENT_RETRY_DELAY_SECONDS = 2.0
 FALLBACK_STATUS_CODES = {404, 408, 429, 500, 502, 503, 504}
+TRANSIENT_RETRY_STATUS_CODES = {408, 500, 502, 503, 504}
 LOGGER = logging.getLogger(__name__)
+
+
+class LLMServiceError(RuntimeError):
+    """Base error for a handled Gemini service failure. / Gemini 服务异常基类。"""
+
+
+class LLMRateLimitError(LLMServiceError):
+    """Gemini quota or rate limit was reached. / Gemini 额度或频率限制已达到。"""
+
+
+class LLMUnavailableError(LLMServiceError):
+    """Gemini is temporarily unavailable or overloaded. / Gemini 暂时不可用或繁忙。"""
 
 
 def create_gemini_client(api_key: str) -> genai.Client:
@@ -83,6 +97,46 @@ def _quota_retry_delay(error: Exception) -> float | None:
     return None
 
 
+def _is_transient_service_error(error: Exception) -> bool:
+    """Identify a temporary API/server failure. / 识别临时 API 或服务端故障。"""
+    if isinstance(error, errors.APIError):
+        try:
+            return int(error.code) in TRANSIENT_RETRY_STATUS_CODES
+        except (TypeError, ValueError):
+            return False
+    return type(error).__name__ in {
+        "ConnectTimeout",
+        "ReadTimeout",
+        "TimeoutException",
+    }
+
+
+def _raise_classified_service_error(error: Exception) -> None:
+    """Convert expected Gemini failures into UI-safe types. / 转换为页面可安全处理的异常。"""
+    if isinstance(error, errors.APIError):
+        try:
+            status_code = int(error.code)
+        except (TypeError, ValueError):
+            status_code = 0
+        if status_code == 429:
+            raise LLMRateLimitError(
+                "The Gemini usage limit was reached."
+            ) from error
+        if status_code in TRANSIENT_RETRY_STATUS_CODES:
+            raise LLMUnavailableError(
+                "The Gemini service is temporarily unavailable."
+            ) from error
+    if type(error).__name__ in {
+        "ConnectTimeout",
+        "ReadTimeout",
+        "TimeoutException",
+    }:
+        raise LLMUnavailableError(
+            "The Gemini service request timed out."
+        ) from error
+    raise error
+
+
 def generate_content_with_fallback(
     client: genai.Client,
     *,
@@ -92,6 +146,7 @@ def generate_content_with_fallback(
     """Generate a complete response with fallback. / 使用主模型和备用模型生成完整响应。"""
     for index, model_name in enumerate(GEMINI_MODEL_CANDIDATES):
         quota_retried = False
+        transient_retried = False
         while True:
             try:
                 return client.models.generate_content(
@@ -112,8 +167,22 @@ def generate_content_with_fallback(
                     time.sleep(retry_delay)
                     continue
                 is_last = index == len(GEMINI_MODEL_CANDIDATES) - 1
+                if (
+                    is_last
+                    and not transient_retried
+                    and _is_transient_service_error(error)
+                ):
+                    transient_retried = True
+                    LOGGER.warning(
+                        "Gemini fallback model %s failed temporarily; "
+                        "retrying once in %.1f seconds.",
+                        model_name,
+                        TRANSIENT_RETRY_DELAY_SECONDS,
+                    )
+                    time.sleep(TRANSIENT_RETRY_DELAY_SECONDS)
+                    continue
                 if is_last or not _can_fallback(error):
-                    raise
+                    _raise_classified_service_error(error)
                 LOGGER.warning(
                     "Gemini model %s failed temporarily; using fallback model.",
                     model_name,
@@ -132,6 +201,7 @@ def stream_content_with_fallback(
     for index, model_name in enumerate(GEMINI_MODEL_CANDIDATES):
         emitted = False
         quota_retried = False
+        transient_retried = False
         while True:
             try:
                 for chunk in client.models.generate_content_stream(
@@ -160,8 +230,23 @@ def stream_content_with_fallback(
                     time.sleep(retry_delay)
                     continue
                 is_last = index == len(GEMINI_MODEL_CANDIDATES) - 1
+                if (
+                    not emitted
+                    and is_last
+                    and not transient_retried
+                    and _is_transient_service_error(error)
+                ):
+                    transient_retried = True
+                    LOGGER.warning(
+                        "Gemini fallback stream %s failed temporarily; "
+                        "retrying once in %.1f seconds.",
+                        model_name,
+                        TRANSIENT_RETRY_DELAY_SECONDS,
+                    )
+                    time.sleep(TRANSIENT_RETRY_DELAY_SECONDS)
+                    continue
                 if emitted or is_last or not _can_fallback(error):
-                    raise
+                    _raise_classified_service_error(error)
                 LOGGER.warning(
                     "Gemini stream %s failed before output; using fallback model.",
                     model_name,
