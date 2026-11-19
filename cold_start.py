@@ -263,12 +263,6 @@ def load_snowflake_config() -> SnowflakeConfig:
     if not isinstance(local_section, dict):
         raise ValueError("Local SNOWFLAKE configuration must be a TOML table.")
 
-    remote_keys = {
-        "account": "SNOWFLAKE_ACCOUNT",
-        "warehouse": "SNOWFLAKE_WAREHOUSE",
-        "token": "SNOWFLAKE_TOKEN",
-    }
-
     def read_remote_value(secret_name: str) -> object:
         """Read a top-level Streamlit secret, then an environment variable.
 
@@ -282,13 +276,24 @@ def load_snowflake_config() -> SnowflakeConfig:
             value = os.getenv(secret_name)
         return value
 
+    # Read the three supported deployment values from their exact top-level
+    # Streamlit Secret names. Each value independently falls back to the
+    # same-named environment variable, then to startup/snowflake.toml below.
+    # 使用明确的顶层 Streamlit Secret 键读取三个远程配置项。
+    remote_account = read_remote_value("SNOWFLAKE_ACCOUNT")
+    remote_warehouse = read_remote_value("SNOWFLAKE_WAREHOUSE")
+    remote_token = read_remote_value("SNOWFLAKE_TOKEN")
+    remote_values = {
+        "account": remote_account,
+        "warehouse": remote_warehouse,
+        "token": remote_token,
+    }
+
     def read_value(field: str) -> object:
         """Read one configured Snowflake value. / 读取一个 Snowflake 配置值。"""
-        secret_name = remote_keys.get(field)
-        if secret_name:
-            remote_value = read_remote_value(secret_name)
-            if remote_value is not None and remote_value != "":
-                return remote_value
+        remote_value = remote_values.get(field)
+        if remote_value is not None and remote_value != "":
+            return remote_value
         return local_section.get(field)
 
     required_fields = ("account", "user", "warehouse", "schema")
