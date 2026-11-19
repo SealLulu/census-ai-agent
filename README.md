@@ -199,7 +199,7 @@ powershell -ExecutionPolicy Bypass -File .\startup\start_win.ps1
 ## Run manually
 
 ```powershell
-pip install -r startup/requirements.txt
+pip install -r requirements.txt
 streamlit run streamlit_app.py
 ```
 
