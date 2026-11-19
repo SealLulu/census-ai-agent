@@ -389,10 +389,11 @@ SNOWFLAKE_TOKEN = "YOUR_PROGRAMMATIC_ACCESS_TOKEN"
 ```
 
 `SNOWFLAKE_ACCOUNT` should normally use the complete `organization-account`
-identifier. If the remote secret contains only the account name and it exactly
-matches the suffix of the local full identifier, cold start safely restores the
-local organization prefix. Full `https://...snowflakecomputing.com` account URLs
-are also normalized. The project pins Snowflake Connector 4.8.1 for consistent
+identifier. A configured remote value strictly overrides the local account and
+is never completed or replaced from `startup/snowflake.toml`, so the remote
+Secret must not contain only the short account name. Full
+`https://...snowflakecomputing.com` account URLs are normalized. The project
+pins Snowflake Connector 4.8.1 for consistent
 Python 3.14 deployment behavior instead of automatically adopting a new major
 connector release.
 

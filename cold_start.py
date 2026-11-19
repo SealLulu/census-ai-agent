@@ -58,11 +58,8 @@ class AppConfig:
     snowflake: SnowflakeConfig
 
 
-def _normalize_snowflake_account(
-    account: str,
-    local_account: object = None,
-) -> str:
-    """Normalize remote account forms without exposing credentials.
+def _normalize_snowflake_account(account: str) -> str:
+    """Normalize one selected account without mixing configuration sources.
 
     标准化远程 Snowflake account 格式，且不接触或暴露认证凭据。
     """
@@ -76,18 +73,6 @@ def _normalize_snowflake_account(
         normalized = normalized[: -len(suffix)]
     normalized = normalized.strip().strip("/").replace("/", "-")
 
-    # A remote value may contain only the account name (for example VFC42336).
-    # Reuse the locally configured organization prefix when it is an exact suffix
-    # match instead of constructing an invalid account endpoint.
-    # 远程值可能只有 account 名；若与本地完整账号后缀精确匹配，则复用本地组织前缀。
-    if (
-        isinstance(local_account, str)
-        and local_account.strip()
-        and "-" not in normalized
-        and "." not in normalized
-        and local_account.strip().upper().endswith("-" + normalized.upper())
-    ):
-        normalized = local_account.strip()
     return normalized
 
 
@@ -226,7 +211,7 @@ def load_gemini_api_key() -> str | None:
     # 优先级：服务器 Secret -> 本地密钥文件 -> 环境变量。
     try:
         api_key = st.secrets["GEMINI_API_KEY"]
-    except Exception:
+    except (KeyError, FileNotFoundError):
         api_key = None
 
     if not api_key:
@@ -263,38 +248,47 @@ def load_snowflake_config() -> SnowflakeConfig:
     if not isinstance(local_section, dict):
         raise ValueError("Local SNOWFLAKE configuration must be a TOML table.")
 
-    def read_remote_value(secret_name: str) -> object:
-        """Read a top-level Streamlit secret, then an environment variable.
+    # Read each deployment value explicitly, following the same pattern as the
+    # Gemini key. A valid Streamlit Secret always wins; only a missing or empty
+    # Secret falls back to the environment and then the local TOML file.
+    # 与 Gemini Key 相同，逐项显式读取顶层 Streamlit Secrets。
+    try:
+        account = st.secrets["SNOWFLAKE_ACCOUNT"]
+    except (KeyError, FileNotFoundError):
+        account = None
+    if not account:
+        account = os.getenv("SNOWFLAKE_ACCOUNT")
+    if not account:
+        account = local_section.get("account")
 
-        先读取顶层 Streamlit Secret，再读取同名环境变量。
-        """
-        try:
-            value = st.secrets[secret_name]
-        except Exception:
-            value = None
-        if value is None or value == "":
-            value = os.getenv(secret_name)
-        return value
+    try:
+        warehouse = st.secrets["SNOWFLAKE_WAREHOUSE"]
+    except (KeyError, FileNotFoundError):
+        warehouse = None
+    if not warehouse:
+        warehouse = os.getenv("SNOWFLAKE_WAREHOUSE")
+    if not warehouse:
+        warehouse = local_section.get("warehouse")
 
-    # Read the three supported deployment values from their exact top-level
-    # Streamlit Secret names. Each value independently falls back to the
-    # same-named environment variable, then to startup/snowflake.toml below.
-    # 使用明确的顶层 Streamlit Secret 键读取三个远程配置项。
-    remote_account = read_remote_value("SNOWFLAKE_ACCOUNT")
-    remote_warehouse = read_remote_value("SNOWFLAKE_WAREHOUSE")
-    remote_token = read_remote_value("SNOWFLAKE_TOKEN")
-    remote_values = {
-        "account": remote_account,
-        "warehouse": remote_warehouse,
-        "token": remote_token,
-    }
+    try:
+        token = st.secrets["SNOWFLAKE_TOKEN"]
+    except (KeyError, FileNotFoundError):
+        token = None
+    if not token:
+        token = os.getenv("SNOWFLAKE_TOKEN")
+    if not token:
+        token = local_section.get("token")
+
+    selected_values = dict(local_section)
+    selected_values.update(
+        account=account,
+        warehouse=warehouse,
+        token=token,
+    )
 
     def read_value(field: str) -> object:
         """Read one configured Snowflake value. / 读取一个 Snowflake 配置值。"""
-        remote_value = remote_values.get(field)
-        if remote_value is not None and remote_value != "":
-            return remote_value
-        return local_section.get(field)
+        return selected_values.get(field)
 
     required_fields = ("account", "user", "warehouse", "schema")
     values: dict[str, str | None] = {}
@@ -308,10 +302,7 @@ def load_snowflake_config() -> SnowflakeConfig:
             )
         normalized_value = value.strip()
         if field == "account":
-            normalized_value = _normalize_snowflake_account(
-                normalized_value,
-                local_section.get("account"),
-            )
+            normalized_value = _normalize_snowflake_account(normalized_value)
             if not normalized_value:
                 raise ValueError(
                     "SNOWFLAKE.account must resolve to a non-empty account identifier."
