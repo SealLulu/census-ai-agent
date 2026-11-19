@@ -138,7 +138,16 @@ def render_history_fragment(username: str, load_limit: int) -> None:
         # 刷新失败时保留当前会话中已经加载的历史记录。
         st.warning(f"Unable to refresh chat history: {error}")
 
-    for message in records_to_display_messages(st.session_state.chat_records):
+    # The current input is already rendered as a live chat bubble below this
+    # fragment. Exclude its in-memory pending record during timed refreshes so
+    # the same user question is not displayed twice.
+    # 当前输入已作为实时聊天气泡显示；定时刷新时排除对应的内存 pending 记录，避免重复显示。
+    visible_records = [
+        record
+        for record in st.session_state.chat_records
+        if record["chat_id"] not in st.session_state.active_chat_ids
+    ]
+    for message in records_to_display_messages(visible_records):
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
