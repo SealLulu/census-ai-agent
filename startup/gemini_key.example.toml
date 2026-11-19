@@ -1,2 +1,0 @@
-# Copy this file to startup/gemini_key.toml, then replace the placeholder.
-GEMINI_API_KEY = "YOUR_GEMINI_API_KEY"
