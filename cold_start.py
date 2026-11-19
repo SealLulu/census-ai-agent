@@ -215,7 +215,10 @@ def load_gemini_api_key() -> str | None:
 
 
 def load_snowflake_config() -> SnowflakeConfig:
-    """Load Snowflake settings, preferring server secrets. / 优先读取服务器配置。"""
+    """Load selected remote Snowflake values plus local fallback settings.
+
+    读取指定的远程 Snowflake 参数，其余参数与缺失值使用本地配置。
+    """
     local_path = STARTUP_DIR / "snowflake.toml"
     try:
         with local_path.open("rb") as local_file:
@@ -227,23 +230,39 @@ def load_snowflake_config() -> SnowflakeConfig:
     if not isinstance(local_section, dict):
         raise ValueError("Local SNOWFLAKE configuration must be a TOML table.")
 
-    try:
-        server_section = st.secrets["SNOWFLAKE"]
-    except Exception:
-        server_section = {}
+    remote_keys = {
+        "account": "SNOWFLAKE_ACCOUNT",
+        "warehouse": "SNOWFLAKE_WAREHOUSE",
+        "token": "SNOWFLAKE_TOKEN",
+    }
+
+    def read_remote_value(secret_name: str) -> object:
+        """Read a top-level Streamlit secret, then an environment variable.
+
+        先读取顶层 Streamlit Secret，再读取同名环境变量。
+        """
+        try:
+            value = st.secrets[secret_name]
+        except Exception:
+            value = None
+        if value is None or value == "":
+            value = os.getenv(secret_name)
+        return value
 
     def read_value(field: str) -> object:
-        """Read one server-first Snowflake setting. / 读取一个服务器优先的 Snowflake 配置。"""
-        try:
-            return server_section[field]
-        except Exception:
-            return local_section.get(field)
+        """Read one configured Snowflake value. / 读取一个 Snowflake 配置值。"""
+        secret_name = remote_keys.get(field)
+        if secret_name:
+            remote_value = read_remote_value(secret_name)
+            if remote_value is not None and remote_value != "":
+                return remote_value
+        return local_section.get(field)
 
     required_fields = ("account", "user", "warehouse", "schema")
     values: dict[str, str | None] = {}
     for field in required_fields:
-        # Each server value overrides its local counterpart independently.
-        # 每个服务器字段分别覆盖对应的本地配置，未配置项仍可使用本地值。
+        # Only the three explicitly supported remote fields override local values.
+        # 仅三个明确支持的远程字段覆盖本地值，其余字段始终读取本地配置。
         value = read_value(field)
         if not isinstance(value, str) or not value.strip():
             raise ValueError(

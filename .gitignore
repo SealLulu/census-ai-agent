@@ -169,7 +169,7 @@ cython_debug/
 #.idea/
 
 # Local Gemini credential
-startup/gemini_key.toml
+#startup/gemini_key.toml
 
 # Local Snowflake credentials
-startup/snowflake.toml
+#startup/snowflake.toml

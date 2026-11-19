@@ -1,0 +1,2 @@
+# Local Google Gemini credential. Do not commit this file.
+GEMINI_API_KEY = ""

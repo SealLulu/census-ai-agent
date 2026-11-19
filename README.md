@@ -151,21 +151,20 @@ any credential. The connector account identifier
 uses the `organization-account` form; the Snowflake login name is still required
 separately.
 
-On a server, Streamlit Secrets take priority for `GEMINI_API_KEY`, `ALLOWED_USERS`, `CHAT_HISTORY_LOAD_LIMIT`, and the `[SNOWFLAKE]` table. Local files are used as fallbacks.
+On a server, Streamlit Secrets take priority for `GEMINI_API_KEY`,
+`ALLOWED_USERS`, and `CHAT_HISTORY_LOAD_LIMIT`. Snowflake accepts the top-level
+remote values `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_WAREHOUSE`, and
+`SNOWFLAKE_TOKEN`; each can also be supplied as an environment variable.
+Remaining Snowflake settings, and local fallbacks for those three values, come
+from `startup/snowflake.toml`.
 
 Example Streamlit Secrets section:
 
 ```toml
 GEMINI_API_KEY = "YOUR_GEMINI_API_KEY"
-
-[SNOWFLAKE]
-auth_method = "PROGRAMMATIC_ACCESS_TOKEN"
-account = "YOUR_ORG-YOUR_ACCOUNT"
-user = "YOUR_SNOWFLAKE_LOGIN_NAME"
-token = "YOUR_OAUTH_ACCESS_TOKEN"
-warehouse = "COMPUTE_WH"
-role = "YOUR_READ_ONLY_ROLE"
-schema = "PUBLIC"
+SNOWFLAKE_ACCOUNT = "YOUR_ORG-YOUR_ACCOUNT"
+SNOWFLAKE_WAREHOUSE = "COMPUTE_WH"
+SNOWFLAKE_TOKEN = "YOUR_PROGRAMMATIC_ACCESS_TOKEN"
 ```
 
 ## Chat history
