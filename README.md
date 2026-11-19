@@ -2,6 +2,43 @@
 
 Explore US Census data through natural language with multi-agent intelligence.
 
+## Web and local usage
+
+### Hosted web application
+
+Open the deployed application at:
+
+<https://census-0blxamkqja9census-ai-agent.streamlit.app/>
+
+1. Enter the GitHub username supplied for evaluation and select **Login**.
+2. After login, enter a US Census question in the chat input. Follow-up
+   questions may refer to the previous conversation context.
+3. Use **Log out** before closing the application when possible so the current
+   username Session is released immediately.
+
+The hosted deployment reads `ALLOWED_USERS` from private Streamlit Secrets.
+Therefore, the web login uses the configured GitHub username and does not read
+the username from `startup/local_config.toml`. Username matching is exact.
+
+### Local application
+
+First complete the Gemini and Snowflake configuration described in
+[Configuration](#configuration). From the repository root, run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\startup\start_win.ps1
+```
+
+Then open <http://127.0.0.1:8501> and log in with `user`. Local startup reads
+this username from the following setting in `startup/local_config.toml`:
+
+```toml
+ALLOWED_USERS = ["user"]
+```
+
+Changing that local list changes the accepted local usernames but does not
+change the hosted deployment's Streamlit Secrets.
+
 ## Architecture
 
 The application uses a layered pipeline so UI state, conversational reasoning,
@@ -28,7 +65,7 @@ flowchart TD
     R -- Intent complete --> I
     R -- SQL complete --> I2[Rebuild schema locally]
     I2 --> M
-    R -- Data complete --> O
+    R -- Data complete --> I2
     E --> F{Intent result}
     F -- INVALID --> G[Return fixed scope message]
     F -- NEEDS_CLARIFICATION --> H[Return clarification and update pending list]
@@ -259,13 +296,23 @@ python -m data_source.test.test_snowflake_query
 
 ## Configuration
 
+### Required credentials before startup
+
+The configuration values shown in this repository and in the examples below
+are placeholders only. The application cannot run successfully until valid
+Gemini and Snowflake credentials have been supplied.
+
 Before starting locally, confirm that:
 
 - `startup/gemini_key.toml` contains a valid `GEMINI_API_KEY`.
 - For a new workspace, create `startup/gemini_key.toml` if it is absent and set
   `GEMINI_API_KEY` to a valid Gemini API key.
 - `startup/local_config.toml` contains an `ALLOWED_USERS` list and a positive integer `CHAT_HISTORY_LOAD_LIMIT`.
-- `startup/snowflake.toml` contains valid local Snowflake connection settings.
+- `startup/snowflake.toml` contains the Snowflake `user`, `account`, credential,
+  and warehouse. The expected warehouse for this project is
+  `warehouse = "COMPUTE_WH"`.
+- The Snowflake credential matches `auth_method`. A token created for one
+  authentication method cannot be used with another method.
 
 The tracked `.streamlit/config.toml` contains runtime settings only—never
 credentials. It enables headless mode and disables usage-stat collection so a
@@ -286,7 +333,7 @@ Example PAT configuration in `startup/snowflake.toml` (ignored by Git because it
 auth_method = "PROGRAMMATIC_ACCESS_TOKEN"
 account = "YOUR_ORG-YOUR_ACCOUNT"
 user = "YOUR_SNOWFLAKE_LOGIN_NAME"
-token = "YOUR_OAUTH_ACCESS_TOKEN"
+token = "YOUR_PROGRAMMATIC_ACCESS_TOKEN"
 warehouse = "COMPUTE_WH"
 role = "YOUR_READ_ONLY_ROLE" # Optional if the token/default role already supplies it.
 schema = "PUBLIC"
@@ -296,9 +343,17 @@ The application always uses the fixed Snowflake database
 `US_OPEN_CENSUS_DATA_NEIGHBORHOOD_INSIGHTS_FREE_DATASET`; it is not read from
 local or server configuration.
 
-For OAuth authentication, set `auth_method = "oauth"`. For password authentication,
-set `auth_method = "password"` and replace `token` with `password`. Never commit
-any credential. The connector account identifier
+Credential requirements are authentication-mode specific:
+
+| `auth_method` | Required credential | Requirement |
+| --- | --- | --- |
+| `PROGRAMMATIC_ACCESS_TOKEN` | `token` | A Snowflake Programmatic Access Token issued for the configured `user` |
+| `oauth` | `token` | A valid OAuth access token |
+| `password` | `password` | The configured Snowflake user's password; remove `token` |
+
+The selected token must be accepted by the matching Snowflake connector
+`authenticator`; changing only the `auth_method` string does not convert a token
+to another authentication type. Never commit any credential. The connector account identifier
 uses the `organization-account` form; the Snowflake login name is still required
 separately.
 
@@ -373,6 +428,11 @@ Each line uses this format:
 
 ## Run on Windows
 
+Complete the required credential configuration above before running the startup
+script. In particular, configure `startup/gemini_key.toml` and set valid
+`user`, `account`, authentication credential, and
+`warehouse = "COMPUTE_WH"` values in `startup/snowflake.toml`.
+
 The startup script creates or reuses `.venv`, installs dependencies, and starts Streamlit:
 
 ```powershell
@@ -380,6 +440,8 @@ powershell -ExecutionPolicy Bypass -File .\startup\start_win.ps1
 ```
 
 ## Run manually
+
+The same Gemini and Snowflake credential requirements apply to manual startup.
 
 ```powershell
 pip install -r requirements.txt
