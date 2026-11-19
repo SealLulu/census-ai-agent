@@ -15,7 +15,7 @@ import sys
 def setup_logger() -> None:
     """Configure process-wide application logging. / 配置进程级应用日志。"""
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.WARNING,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
         handlers=[logging.StreamHandler(sys.stdout)],
         force=True,
