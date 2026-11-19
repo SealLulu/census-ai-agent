@@ -131,6 +131,20 @@ Rules:
     medians, rates, or percentages to manufacture a state, county, or city value.
     If an appropriate aggregate field or weighting method is not provided,
     return insufficient_schema.
+20. A Census indicator ID is not a physical Snowflake table name. For example,
+    B01001 does not mean a table named 2020_CBG_B01001. Use only the exact
+    metrics[].physical_table and table_name values supplied by Schema Retrieval.
+21. Before using a metric, require metrics[].complete to be true and use every
+    field in its required_columns according to column_roles. If the group is
+    incomplete, return insufficient_schema instead of substituting a nearby field.
+22. Composite metrics must follow aggregation_semantics. For an age-65-plus
+    percentage, SUM all numerator fields, divide by the denominator with NULLIF,
+    and do not omit sex-specific age bands.
+23. A multi-metric question must cover every requested metric. Never silently
+    answer only one metric; report insufficient_schema when any required metric
+    or verified join is unavailable.
+24. median_household_income is non-additive. Do not SUM or AVG block-group
+    medians to manufacture a state or county median.
 """
 
 

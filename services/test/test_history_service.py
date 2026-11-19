@@ -4,21 +4,13 @@ Test exact completed-answer lookup in per-user JSONL history.
 测试用户隔离 JSONL 历史中的完全一致已完成回答检索。
 """
 
-import json
-from io import StringIO
 import unittest
-from unittest.mock import MagicMock, patch
 
 from services import history_service
 
 
 class ExactHistoryLookupTest(unittest.TestCase):
     """Verify strict and safe history reuse. / 验证严格且安全的历史复用。"""
-
-    def _history_stream(self, records: list[dict]) -> StringIO:
-        return StringIO(
-            "".join(json.dumps(record) + "\n" for record in records)
-        )
 
     def test_returns_latest_exact_successful_answer(self) -> None:
         first = history_service.build_history_record(
@@ -41,18 +33,10 @@ class ExactHistoryLookupTest(unittest.TestCase):
             intent_status=history_service.INTENT_STATUS_NEW,
             resolution=history_service.RESOLUTION_NONE,
         )
-        stream = self._history_stream([first, latest])
-        history_path = MagicMock()
-        history_path.open.return_value = stream
-        with patch.object(
-            history_service,
-            "get_chat_history_path",
-            return_value=history_path,
-        ):
-            result = history_service.find_exact_completed_record(
-                "alice",
-                "  Population in California?  ",
-            )
+        result = history_service.find_exact_completed_record(
+            [first, latest],
+            "  Population in California?  ",
+        )
         self.assertIsNotNone(result)
         self.assertEqual(result["chat_id"], "latest")
 
@@ -69,19 +53,41 @@ class ExactHistoryLookupTest(unittest.TestCase):
             valid_status=history_service.VALID_STATUS_VALID,
             response_status=history_service.RESPONSE_STATUS_PENDING,
         )
-        stream = self._history_stream([failed, pending])
-        history_path = MagicMock()
-        history_path.open.return_value = stream
-        with patch.object(
-            history_service,
-            "get_chat_history_path",
-            return_value=history_path,
-        ):
-            result = history_service.find_exact_completed_record(
-                "alice",
-                "Population in Texas?",
-            )
+        result = history_service.find_exact_completed_record(
+            [failed, pending],
+            "Population in Texas?",
+        )
         self.assertIsNone(result)
+
+    def test_does_not_search_outside_loaded_limit(self) -> None:
+        older_match = history_service.build_history_record(
+            chat_id="outside-limit",
+            user_input="Population in Washington state in 2019?",
+            valid_status=history_service.VALID_STATUS_VALID,
+            response="Older answer",
+            sql="SELECT 1",
+            sql_resp='{"rows": [[1]]}',
+            intent_status=history_service.INTENT_STATUS_NEW,
+            resolution=history_service.RESOLUTION_NONE,
+        )
+        loaded_tail = [
+            history_service.build_history_record(
+                chat_id="inside-limit",
+                user_input="A different question",
+                valid_status=history_service.VALID_STATUS_VALID,
+                response="Different answer",
+                sql="SELECT 2",
+                sql_resp='{"rows": [[2]]}',
+                intent_status=history_service.INTENT_STATUS_NEW,
+                resolution=history_service.RESOLUTION_NONE,
+            )
+        ]
+        self.assertIsNone(
+            history_service.find_exact_completed_record(
+                loaded_tail,
+                older_match["text"],
+            )
+        )
 
 
 if __name__ == "__main__":

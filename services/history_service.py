@@ -26,6 +26,7 @@ Functions / 包含函数:
 - load_history_records: Load the latest JSONL records. / 读取末尾历史记录。
 - append_history_record: Append one complete record. / 追加一条完整记录。
 - find_exact_completed_record: Find a reusable exact prior answer. / 查找可复用的完全一致历史回答。
+- latest_history_activity: Parse the latest record time. / 解析最近历史记录时间。
 - build_history_record: Build a canonical record. / 构造标准记录。
 - records_to_model_messages: Convert records for Agents. / 转换为 Agent 历史消息。
 - records_to_display_messages: Convert records for the UI. / 转换为页面显示消息。
@@ -189,57 +190,47 @@ def append_history_record(username: str, record: dict[str, Any]) -> None:
 
 
 def find_exact_completed_record(
-    username: str,
+    records: list[dict[str, Any]],
     user_input: str,
 ) -> dict[str, Any] | None:
-    """Return the latest successful record with exactly the same question.
+    """Return the latest successful exact match inside the loaded history limit.
 
-    返回原始问题完全一致的最近一条成功记录。仅忽略首尾空白；不会复用 pending、
-    非法、异常提示或缺少 Snowflake 数据的记录。
+    在已加载历史条数限制内返回原始问题完全一致的最近成功记录。仅忽略首尾空白；
+    不会复用 pending、非法、异常提示或缺少 Snowflake 数据的记录。
     """
     expected_text = user_input.strip()
     if not expected_text:
         return None
+    for record in reversed(records):
+        if (
+            record["text"].strip() == expected_text
+            and record["valid_status"] == VALID_STATUS_VALID
+            and record["response_status"] == RESPONSE_STATUS_NORMAL
+            and record["intent_status"] == INTENT_STATUS_NEW
+            and bool(record["response"].strip())
+            and bool(record["sql_resp"].strip())
+            and record["resolution"] != RESOLUTION_NEEDS_CLARIFICATION
+        ):
+            return record
+    return None
 
-    history_path = get_chat_history_path(username)
-    latest_match: dict[str, Any] | None = None
-    with history_path.open("r", encoding="utf-8") as history_file:
-        for line_number, line in enumerate(history_file, start=1):
-            raw_line = line.strip()
-            if not raw_line:
-                continue
-            try:
-                decoded = json.loads(raw_line)
-            except json.JSONDecodeError as error:
-                raise ValueError(
-                    f"Invalid JSONL chat history for user '{username}'."
-                ) from error
-            if not isinstance(decoded, dict):
-                raise ValueError(
-                    f"Invalid chat history record for user '{username}'."
-                )
-            record = _normalize_legacy_record(
-                decoded,
-                username,
-                line_number,
-                raw_line,
-            )
-            if not _is_valid_record(record):
-                raise ValueError(
-                    f"Invalid chat history record for user '{username}'."
-                )
-            if (
-                record["text"].strip() == expected_text
-                and record["valid_status"] == VALID_STATUS_VALID
-                and record["response_status"] == RESPONSE_STATUS_NORMAL
-                and record["intent_status"] == INTENT_STATUS_NEW
-                and bool(record["response"].strip())
-                and bool(record["sql_resp"].strip())
-                and record["resolution"]
-                != RESOLUTION_NEEDS_CLARIFICATION
-            ):
-                latest_match = record
-    return latest_match
+
+def latest_history_activity(
+    records: list[dict[str, Any]],
+) -> datetime | None:
+    """Parse the latest stored record time as UTC. / 将最近历史时间解析为 UTC。"""
+    if not records:
+        return None
+    value = records[-1].get("time_stamp", "").strip()
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def build_history_record(

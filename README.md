@@ -64,13 +64,15 @@ The Intent Agent is also the operational scope guardrail: unrelated, unsupported
 
 The application reads the generated metadata-only Catalog at `data_source/census_schema_catalog_verified.sqlite`. The original input remains at `data_source/census_schema_catalog.sqlite`. Both SQLite files contain `columns`, the FTS5 `field_search` index, `relationships`, and `table_semantics`. `data_source.schema_retriever.retrieve_schema(question, years=[2019, 2020])` opens the verified Catalog once in read-only mode and searches all relevant `{year}_%` tables independently for every requested year, including regular CBG tables, Redistricting tables, and geographic metadata. A single-year request uses `[2019]` or `[2020]`; the application defaults to `[2020]` when the question contains no year.
 
-The Retriever first obtains a wider FTS5 candidate pool, filters ordinary questions toward Estimate fields instead of MarginOfError fields, and then re-ranks candidates using phrase coverage, business descriptions, and total-population semantics. Explicit population, median-household-income, and housing-tenure phrases also supplement FTS5 with real Catalog rows; owner-occupied/renter-occupied requests always receive both required tenure fields. Its response contains enriched `tables`, ranked `columns`, related JOIN paths, related-table columns, and explicit `warnings`.
+The Retriever now separates metric discovery from field retrieval. Recognized metrics are expanded from Catalog metadata into complete field groups before any fallback search: total population resolves to the semantic `B01001` total, median household income resolves to its complete indicator group, age 65+ includes the total-population denominator and all 12 male/female numerator bands, and owner/renter tenure includes both required members. Multi-metric questions retain every discovered group. Unknown or explicitly subgrouped metrics still use a wider FTS5 candidate pool, but results are balanced across indicator groups so one wide group cannot occupy the entire result window. The response includes `metrics` with physical tables, indicator IDs, required columns, column roles, completeness, and aggregation semantics, plus enriched `tables`, ranked `columns`, JOIN paths, related-table columns, and `warnings`.
+
+Indicator IDs and physical Snowflake tables are intentionally separate. For example, `B01001` is an indicator ID whose physical 2020 table is `2020_CBG_B01`; it must never be converted into an invented table such as `2020_CBG_B01001`. The SQL Agent prompt and SQL Validator both enforce the exact physical tables returned by Schema Retrieval. Regression tests cover unsupported Seattle city mapping, combined population/income retrieval, complete age-65+ expansion, California/Texas population comparison, and basic total-population selection.
 
 For recognized state and county requests, `geographic_context` contains exact `STATE_FIPS` and `COUNTY_FIPS` filters that have also been checked against the geometry-table columns in the Catalog. These filters are applied directly to the matching `{year}_CBG_GEOMETRY_WKT` table with `requires_fips_join = false`; an extra FIPS lookup JOIN is not generated. The California, Texas, Washington, New York, and King County test mappings were checked against Snowflake; King County uses `STATE_FIPS=53` and `COUNTY_FIPS=033`. Multi-state comparisons use OR-ed filter groups. The legacy `geography_filters` field remains for compatibility. A request such as Seattle that lacks a verified city-to-CBG boundary mapping is returned in `unsupported_geographies` and fails closed instead of silently becoming a Washington-wide query. Table-level purpose information is included where `table_semantics` provides it; remaining tables continue to rely on `table_title`, `topics`, `universe`, and `field_path`. For compatibility, a single year can also be passed as `year=2020`; do not pass `year` and `years` together.
 
 Catalog relationships default to `verification_status = "candidate_unverified"`. They are returned as discovery context, but the SQL Agent is instructed not to generate those JOINs and the SQL Validator rejects them. Run `python scripts/verify_relationships.py` to copy the source Catalog and generate `data_source/census_schema_catalog_verified.sqlite`. The script uses read-only Snowflake `SELECT` queries to check key non-nullness, source/target uniqueness, and complete source coverage for every 2019/2020 `cbg_to_geography` candidate; it never changes Snowflake or the source Catalog. In the current Catalog, 65 of 66 CBG-to-geometry relationships passed. `2019_CBG_PATTERNS` remains unverified because its source key contains null and unmatched rows. Other relationship kinds are not implicitly verified and remain blocked until separately checked. The SQL Agent prefers the shortest verified path and does not aggregate CBG-level medians, rates, or percentages into statistically invalid state/county/city values.
 
-The retriever is used by the chat workflow before Text-to-SQL generation. Its real Catalog results have been verified for population, household income, housing, and margin-of-error queries.
+The retriever is used by the chat workflow before Text-to-SQL generation. Its real Catalog results have been verified for population, household income, age 65+, housing tenure, geography handling, and physical-table validation.
 
 ## Text-to-SQL Agent
 
@@ -82,11 +84,17 @@ Run the manual generation smoke test after configuring the Gemini API key. It do
 python -m data_source.test.test_sql_agent
 ```
 
-Before Snowflake execution, `data_source.sql_validator.validate_sql` parses the statement with the Snowflake dialect and rejects multiple statements, non-SELECT operations, wildcard fields, unqualified or unrecognized tables, columns outside the retrieved context, unverified joins, and missing or excessive limits. `data_source.census_data_service.query_census_data` validates again, logs the normalized SQL immediately before the Snowflake call, uses the configured read-only role, applies connection and 30-second statement timeouts, and returns at most 1,000 rows. Credentials and returned rows are never written to this SQL log. Validation, connection, timeout, and execution failures are logged with their technical details, while the chat page returns the user-friendly English message `The Census data query failed. Please try again later.` without exposing SQL or credentials.
+Before Snowflake execution, `data_source.sql_validator.validate_sql` parses the statement with the Snowflake dialect and rejects multiple statements, non-SELECT operations, wildcard fields, unqualified or unrecognized tables, columns outside the retrieved context, unverified joins, and missing or excessive limits. `data_source.census_data_service.query_census_data` validates again, logs the normalized SQL immediately before the Snowflake call, uses the configured read-only role, applies connection and 30-second statement timeouts, and returns at most 1,000 rows. Credentials and returned rows are never written to this SQL log. Insufficient schema, validation, connection, timeout, and execution failures keep their technical details in server logs, while the chat page returns the user-friendly English message `The Census data service encountered an issue. Please try rephrasing your question or ask a different Census question.` without exposing SQL, schema details, or credentials.
 
 Gemini failures are also degraded gracefully after bounded fallback and retry attempts. A temporary `503` or timeout displays `The AI model is temporarily busy. Please wait a moment and try again.` A `429` quota or rate-limit response displays `The AI model usage limit has been reached. Please wait and try again later.` Technical details remain in server logs, and the displayed message is stored as the completed chat response.
 
 Each authenticated browser session permits only one active chat workflow. After a question is submitted, Streamlit immediately reruns with the chat input disabled and displays `Processing the current question...`. The input is re-enabled only after the current Agent/Snowflake workflow completes or returns a handled error. A server-side session-state guard also rejects stale duplicate submissions, so one user cannot replace an in-flight question with a new one.
+
+The single-instance login registry normally permits one browser session per
+user. If a browser closes without logging out, a new browser may take ownership
+after ten minutes of inactivity. The takeover check uses the newer of the
+in-memory session activity and the latest loaded history timestamp, preventing a
+recently active session or recently completed question from being displaced.
 
 After configuring a valid API key and all Snowflake credentials, run the manual end-to-end test:
 
@@ -186,9 +194,10 @@ connector release.
 
 Chat history is stored locally in `chat_history` using JSON Lines (`.jsonl`), with one complete Q&A record per line. Login loads only the latest `CHAT_HISTORY_LOAD_LIMIT` records. The directory is retained in Git through `.gitkeep`, while generated history files are ignored.
 
-Before calling the Intent Agent, the page searches the current user's complete
-JSONL file for an exactly matching original question (ignoring only leading and
-trailing whitespace). The latest completed `NEW` answer is reused immediately,
+Before calling the Intent Agent, the page searches the current user's currently
+loaded `CHAT_HISTORY_LOAD_LIMIT` records for an exactly matching original
+question (ignoring only leading and trailing whitespace). It searches newest
+first, so the most recent completed `NEW` answer is reused immediately,
 including its rewritten question and data provenance, without calling Gemini or
 Snowflake again. Pending clarifications, follow-ups, invalid requests, technical
 error responses, and records without Snowflake data are never reused. Cache

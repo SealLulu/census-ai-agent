@@ -91,27 +91,48 @@ COUNTY_FIPS = {
 # 当前 Catalog 没有经过验证的城市边界映射；城市请求必须明确失败，不能静默扩大为州级查询。
 UNSUPPORTED_CITY_NAMES = {"seattle"}
 
-# These fields supplement FTS5 for explicit, high-value metrics. They are read
-# back from the Catalog so the SQL Agent still receives the real descriptions,
-# types, and semantics rather than hard-coded metadata.
-# 这些字段仅作为明确业务指标的 FTS5 兜底；实际描述、类型和语义仍从 Catalog 读取。
-IMPORTANT_METRICS = {
-    "population": {
+# Metric definitions identify Census indicator groups, never physical columns.
+# Field members are expanded from Catalog metadata such as table_number,
+# field_path, universe, and kind so composite metrics remain complete.
+# 指标定义只识别 Census 指标组，不硬编码物理字段；成员由 Catalog 元数据动态展开。
+METRIC_DEFINITIONS = {
+    "total_population": {
+        "aliases": ("population", "total population"),
         "table_suffix": "CBG_B01",
-        "columns": ["B01001e1"],
+        "table_number": "B01001",
+        "selector": "total_population",
+        "aggregation": "additive_count",
+        "required_role_counts": {"value": 1},
     },
-    "median household income": {
+    "median_household_income": {
+        "aliases": ("median household income", "household income"),
         "table_suffix": "CBG_B19",
-        "columns": ["B19013e1"],
+        "table_number": "B19013",
+        "selector": "all_indicator_fields",
+        "aggregation": "non_additive_median",
+        "required_role_counts": {"value": 1},
     },
-    "owner-occupied": {
+    "age_65_plus": {
+        "aliases": ("age 65+", "65 years and over", "65 or older"),
+        "table_suffix": "CBG_B01",
+        "table_number": "B01001",
+        "selector": "age_65_plus",
+        "aggregation": "ratio_of_additive_counts",
+        "required_role_counts": {"denominator": 1, "numerator": 12},
+    },
+    "housing_tenure": {
+        "aliases": ("owner-occupied", "renter-occupied", "housing tenure"),
         "table_suffix": "CBG_B25",
-        "columns": ["B25003e2", "B25003e3"],
+        "table_number": "B25003",
+        "selector": "housing_tenure_members",
+        "aggregation": "additive_count_members",
+        "required_role_counts": {"members": 2},
     },
-    "renter-occupied": {
-        "table_suffix": "CBG_B25",
-        "columns": ["B25003e2", "B25003e3"],
-    },
+}
+
+DEMOGRAPHIC_SUBGROUP_TERMS = {
+    "race", "racial", "ethnicity", "ethnic", "sex", "gender", "male",
+    "female",
 }
 
 # These terms describe conversational structure or geography rather than a
@@ -280,80 +301,207 @@ def _catalog_validated_geographic_context(
     return context, []
 
 
-def _metric_search_phrases(question: str) -> set[str]:
-    """Find explicit metric fallback phrases. / 识别明确的指标兜底短语。"""
+def _discover_metric_ids(question: str) -> list[str]:
+    """Discover every requested statistical metric. / 发现问题要求的全部统计指标。"""
     text = " ".join(question.lower().replace("_", " ").split())
-    matched: set[str] = set()
-    if re.search(r"\bpopulation\b", text):
-        matched.add("population")
-    if "median household income" in text:
-        matched.add("median household income")
-    if re.search(r"\bowner[ -]occupied\b", text):
-        matched.add("owner-occupied")
-    if re.search(r"\brenter[ -]occupied\b", text):
-        matched.add("renter-occupied")
-    return matched
+    discovered: list[str] = []
+    age_65_plus = bool(
+        re.search(
+            r"\b65\s*(?:\+|plus|(?:years?\s+)?(?:and|or)\s+(?:over|older))\b",
+            text,
+        )
+        or re.search(r"\b(?:over|above)\s+65\b", text)
+    )
+    if re.search(r"\bpopulation\b", text) and (
+        "total population" in text or not age_65_plus
+    ):
+        discovered.append("total_population")
+    if "household income" in text:
+        discovered.append("median_household_income")
+    if age_65_plus:
+        discovered.append("age_65_plus")
+    if (
+        re.search(r"\bowner[ -]occupied\b", text)
+        or re.search(r"\brenter[ -]occupied\b", text)
+        or "housing tenure" in text
+    ):
+        discovered.append("housing_tenure")
+    return list(dict.fromkeys(discovered))
 
 
-def _retrieve_important_metric_columns(
+def _is_total_population_field(field_path: str) -> bool:
+    """Identify the overall B01001 total using semantics. / 按语义识别 B01001 总人口。"""
+    parts = [part.strip().lower() for part in field_path.split(">")]
+    return (
+        len(parts) >= 2
+        and parts[-1] == "total"
+        and "total population" in parts
+        and "male" not in parts
+        and "female" not in parts
+    )
+
+
+def _is_age_65_plus_member(field_path: str) -> bool:
+    """Identify a leaf age band whose lower bound is at least 65. / 识别下限至少 65 岁的叶子年龄段。"""
+    leaf = field_path.rsplit(">", 1)[-1].strip().lower()
+    match = re.search(r"\b(\d{1,3})\b", leaf)
+    return bool(match and int(match.group(1)) >= 65 and "year" in leaf)
+
+
+def _select_metric_rows(
+    rows: list[sqlite3.Row],
+    selector: str,
+) -> tuple[list[sqlite3.Row], dict[str, list[str]]]:
+    """Expand one indicator group into required members. / 将一个指标组展开为必需成员。"""
+    if selector == "all_indicator_fields":
+        selected = rows
+        roles = {"value": [row["column_name"] for row in selected]}
+    elif selector == "total_population":
+        selected = [
+            row for row in rows
+            if _is_total_population_field(str(row["field_path"] or ""))
+        ]
+        roles = {"value": [row["column_name"] for row in selected]}
+    elif selector == "age_65_plus":
+        denominator = [
+            row for row in rows
+            if _is_total_population_field(str(row["field_path"] or ""))
+        ]
+        numerator = [
+            row for row in rows
+            if _is_age_65_plus_member(str(row["field_path"] or ""))
+        ]
+        selected = denominator + numerator
+        roles = {
+            "denominator": [row["column_name"] for row in denominator],
+            "numerator": [row["column_name"] for row in numerator],
+        }
+    elif selector == "housing_tenure_members":
+        selected = [
+            row for row in rows
+            if any(
+                term in str(row["field_path"] or "").lower()
+                for term in ("owner occupied", "renter occupied")
+            )
+        ]
+        roles = {"members": [row["column_name"] for row in selected]}
+    else:
+        raise ValueError(f"Unknown metric selector: {selector}")
+    return selected, roles
+
+
+def _retrieve_metric_groups(
     connection: sqlite3.Connection,
     question: str,
     year: int,
-) -> tuple[list[dict[str, Any]], list[str]]:
-    """Read explicit metric fields from the Catalog. / 从 Catalog 读取明确指标字段。"""
-    phrases = _metric_search_phrases(question)
-    requested: list[tuple[str, str]] = []
-    for phrase in IMPORTANT_METRICS:
-        if phrase not in phrases:
-            continue
-        metric = IMPORTANT_METRICS[phrase]
-        table_name = f"{year}_{metric['table_suffix']}"
-        for column_name in metric["columns"]:
-            identity = (table_name, column_name)
-            if identity not in requested:
-                requested.append(identity)
-    if not requested:
-        return [], []
-
-    clauses = " OR ".join(
-        "(c.table_name = ? AND c.column_name = ?)" for _ in requested
-    )
-    parameters = [value for identity in requested for value in identity]
-    rows = connection.execute(
-        f"""
-        SELECT
-            c.table_name,
-            c.column_name,
-            c.data_type,
-            c.ordinal_position,
-            c.table_number,
-            c.table_title,
-            c.topics,
-            c.universe,
-            c.field_path,
-            c.kind,
-            s.purpose AS semantic_purpose,
-            NULL AS relevance_score
-        FROM columns AS c
-        LEFT JOIN table_semantics AS s ON s.table_name = c.table_name
-        WHERE {clauses}
-        """,
-        parameters,
-    ).fetchall()
-    rows_by_identity = {
-        (row["table_name"], row["column_name"]): dict(row) for row in rows
-    }
-    result: list[dict[str, Any]] = []
+    allowed_kinds: tuple[str, ...],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    """Discover metrics and expand complete Catalog field groups. / 发现指标并展开完整 Catalog 字段组。"""
+    columns: list[dict[str, Any]] = []
+    metric_context: list[dict[str, Any]] = []
     missing: list[str] = []
-    for identity in requested:
-        column = rows_by_identity.get(identity)
-        if column is None:
-            missing.append(f"{identity[0]}.{identity[1]}")
+    kind_placeholders = ", ".join("?" for _ in allowed_kinds)
+    for metric_id in _discover_metric_ids(question):
+        definition = METRIC_DEFINITIONS[metric_id]
+        table_name = f"{year}_{definition['table_suffix']}"
+        rows = connection.execute(
+            f"""
+            SELECT
+                c.table_name,
+                c.column_name,
+                c.data_type,
+                c.ordinal_position,
+                c.table_number,
+                c.table_title,
+                c.topics,
+                c.universe,
+                c.field_path,
+                c.kind,
+                s.purpose AS semantic_purpose,
+                NULL AS relevance_score
+            FROM columns AS c
+            LEFT JOIN table_semantics AS s ON s.table_name = c.table_name
+            WHERE c.table_name = ?
+              AND c.table_number = ?
+              AND c.kind IN ({kind_placeholders})
+            ORDER BY c.ordinal_position
+            """,
+            (
+                table_name,
+                definition["table_number"],
+                *allowed_kinds,
+            ),
+        ).fetchall()
+        selected, roles = _select_metric_rows(rows, definition["selector"])
+        required_columns = [row["column_name"] for row in selected]
+        expected_counts = definition["required_role_counts"]
+        complete = bool(required_columns) and all(
+            len(roles.get(role, [])) == expected_count
+            for role, expected_count in expected_counts.items()
+        )
+        if not complete:
+            missing.append(
+                f"{table_name} indicator {definition['table_number']} "
+                f"for metric {metric_id}; expected role counts {expected_counts}, "
+                f"found { {role: len(values) for role, values in roles.items()} }"
+            )
             continue
-        column["retrieval_score"] = -1000.0
-        column["retrieval_source"] = "important_metric_fallback"
-        result.append(column)
-    return result, missing
+        for row in selected:
+            column = dict(row)
+            column["retrieval_score"] = -2000.0
+            column["retrieval_source"] = "metric_group_expansion"
+            column["metric_id"] = metric_id
+            columns.append(column)
+        metric_context.append(
+            {
+                "metric_id": metric_id,
+                "year": year,
+                "physical_table": table_name,
+                "indicator_id": definition["table_number"],
+                "required_columns": required_columns,
+                "column_roles": roles,
+                "aggregation_semantics": definition["aggregation"],
+                "complete": complete,
+            }
+        )
+    return columns, metric_context, missing
+
+
+def _needs_fts_supplement(question: str, metric_ids: list[str]) -> bool:
+    """Keep FTS5 for unknown or explicitly subgrouped metrics. / 为未知或细分指标保留 FTS5。"""
+    text_terms = set(re.findall(r"[a-z]+", question.lower()))
+    if not metric_ids or bool(text_terms & DEMOGRAPHIC_SUBGROUP_TERMS):
+        return True
+    # A broad age breakdown still needs discovery. A recognized 65+ request is
+    # already expanded into its complete numerator/denominator field group.
+    # 普通年龄分组仍需全文检索；已识别的 65+ 指标则由完整字段组负责。
+    return "age" in text_terms and "age_65_plus" not in metric_ids
+
+
+def _balance_ranked_fields(
+    ranked: list[dict[str, Any]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Round-robin fields across indicator groups. / 在指标组之间轮询选择字段。"""
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for column in ranked:
+        key = (
+            str(column.get("table_name", "")),
+            str(column.get("table_number", "")),
+        )
+        groups.setdefault(key, []).append(column)
+    selected: list[dict[str, Any]] = []
+    while groups and len(selected) < limit:
+        empty: list[tuple[str, str]] = []
+        for key in list(groups):
+            selected.append(groups[key].pop(0))
+            if not groups[key]:
+                empty.append(key)
+            if len(selected) >= limit:
+                break
+        for key in empty:
+            groups.pop(key, None)
+    return selected
 
 
 def _merge_column_matches(
@@ -761,11 +909,19 @@ def retrieve_schema(
         # same result window instead of competing for one global LIMIT.
         # 每个年份独立检索，避免跨年份查询时某一年占满全部结果窗口。
         matches: list[dict[str, Any]] = []
+        metric_contexts: list[dict[str, Any]] = []
         relationships: list[dict[str, Any]] = []
         years_without_matches: list[int] = []
-        missing_important_fields: list[str] = []
+        missing_metric_groups: list[str] = []
         geographic_contexts: list[dict[str, Any]] = []
         missing_geographic_fields: list[str] = []
+        discovered_metric_ids = _discover_metric_ids(question)
+        if wants_margin and wants_estimate:
+            allowed_kinds = ("Estimate", "MarginOfError")
+        elif wants_margin:
+            allowed_kinds = ("MarginOfError",)
+        else:
+            allowed_kinds = ("Estimate",)
         for year in normalized_years:
             retrieval_pool = min(
                 max(limit * RETRIEVAL_POOL_MULTIPLIER, MIN_RETRIEVAL_POOL),
@@ -802,27 +958,36 @@ def retrieve_schema(
                     retrieval_pool,
                 ),
             ).fetchall()
-            ranked_year_matches = _rank_field_matches(
+            ranked_fts_matches = _rank_field_matches(
                 year_rows,
                 question,
                 search_terms,
-                limit,
+                retrieval_pool,
             )
-            important_columns, missing_columns = (
-                _retrieve_important_metric_columns(
+            if _needs_fts_supplement(question, discovered_metric_ids):
+                ranked_fts_matches = _balance_ranked_fields(
+                    ranked_fts_matches,
+                    limit,
+                )
+            else:
+                ranked_fts_matches = []
+            metric_columns, year_metric_contexts, missing_groups = (
+                _retrieve_metric_groups(
                     connection,
                     question,
                     year,
+                    allowed_kinds,
                 )
             )
-            # Explicit metric fields supplement rather than replace FTS5. Put
-            # them first, then de-duplicate by exact table and column name.
-            # 明确指标字段只补充 FTS5，并按表名和字段名精确去重。
+            # Complete metric groups take priority. Balanced FTS results only
+            # supplement unknown or explicitly subgrouped metrics.
+            # 完整指标组优先；平衡后的 FTS 只补充未知指标或明确细分问题。
             ranked_year_matches = _merge_column_matches(
-                important_columns,
-                ranked_year_matches,
+                metric_columns,
+                ranked_fts_matches,
             )
-            missing_important_fields.extend(missing_columns)
+            metric_contexts.extend(year_metric_contexts)
+            missing_metric_groups.extend(missing_groups)
             matches.extend(ranked_year_matches)
             if not ranked_year_matches:
                 years_without_matches.append(year)
@@ -885,10 +1050,10 @@ def retrieve_schema(
             + ", ".join(str(year) for year in years_without_matches)
             + "."
         )
-    if missing_important_fields:
+    if missing_metric_groups:
         warnings.append(
-            "Important metric fallback fields are missing from the Catalog: "
-            + ", ".join(missing_important_fields)
+            "Required metric groups are incomplete in the Catalog: "
+            + ", ".join(missing_metric_groups)
             + "."
         )
     if missing_geographic_fields:
@@ -944,6 +1109,7 @@ def retrieve_schema(
         # 非空值表示必须停止，因为 Catalog 无法安全映射这些边界到 CBG。
         "unsupported_geographies": _unsupported_geographies(question),
         "tables": tables,
+        "metrics": metric_contexts,
         "columns": matches,
         "relationships": relationships,
         "relationship_tables": relationship_tables,
@@ -955,6 +1121,14 @@ def retrieve_schema(
                 "Relationships marked candidate_unverified are discovery hints only. "
                 "Do not generate or execute a JOIN until Snowflake uniqueness and "
                 "row-coverage checks promote the relationship to verified."
+            ),
+        },
+        "physical_table_policy": {
+            "indicator_ids_are_tables": False,
+            "warning": (
+                "A Census indicator ID such as B01001 is not a physical table "
+                "name. Use only metrics[].physical_table and exact table names "
+                "returned by this schema context."
             ),
         },
     }

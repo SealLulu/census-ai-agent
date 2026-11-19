@@ -1,13 +1,13 @@
 """
 Summary / 文件概要:
-Regression-test verified geographic filters and important metric supplementation
+Regression-test verified geographic filters and complete metric-group expansion
 against the bundled Census Schema Catalog.
 基于项目内 Census Schema Catalog 回归测试已验证地理筛选和重要指标字段补齐。
 
 Tests / 包含测试:
 - State and King County FIPS contexts. / 州及 King County FIPS 上下文。
 - Multi-location filter grouping. / 多地点筛选分组。
-- Population, income, and tenure fallback fields. / 人口、收入和住房指标兜底字段。
+- Population, income, age, and tenure field groups. / 人口、收入、年龄和住房字段组。
 - Cross-year field supplementation and de-duplication. / 跨年份字段补齐与去重。
 """
 
@@ -75,7 +75,7 @@ class SchemaRetrieverTest(unittest.TestCase):
             ["06", "48"],
         )
 
-    def test_important_metrics_are_supplemented_and_deduplicated(self) -> None:
+    def test_metric_groups_are_expanded_and_deduplicated(self) -> None:
         cases = {
             "population": {("2020_CBG_B01", "B01001e1")},
             "median household income": {("2020_CBG_B19", "B19013e1")},
@@ -100,6 +100,10 @@ class SchemaRetrieverTest(unittest.TestCase):
                         if (item["table_name"], item["column_name"]) == identity
                     )
                     self.assertTrue(column["field_path"])
+                    self.assertEqual(
+                        column["retrieval_source"],
+                        "metric_group_expansion",
+                    )
 
     def test_cross_year_tenure_fields(self) -> None:
         result = retrieve_schema(
@@ -158,6 +162,76 @@ class SchemaRetrieverTest(unittest.TestCase):
         )
         self.assertIsNone(result["geographic_context"])
         self.assertEqual(result["unsupported_geographies"], ["Seattle"])
+
+    def test_multi_metric_query_returns_population_and_income_groups(self) -> None:
+        result = retrieve_schema(
+            "Compare total population and median household income in California and Texas",
+            years=[2020],
+        )
+        identities = {
+            (column["table_name"], column["column_name"])
+            for column in result["columns"]
+        }
+        self.assertIn(("2020_CBG_B01", "B01001e1"), identities)
+        self.assertIn(("2020_CBG_B19", "B19013e1"), identities)
+        metrics = {metric["metric_id"]: metric for metric in result["metrics"]}
+        self.assertEqual(
+            set(metrics), {"total_population", "median_household_income"}
+        )
+        self.assertEqual(
+            metrics["median_household_income"]["aggregation_semantics"],
+            "non_additive_median",
+        )
+
+    def test_age_65_plus_percentage_returns_complete_field_group(self) -> None:
+        result = retrieve_schema(
+            "What percentage of Washington's population was age 65 or older in 2020?",
+            years=[2020],
+        )
+        age_metric = next(
+            metric
+            for metric in result["metrics"]
+            if metric["metric_id"] == "age_65_plus"
+        )
+        expected_numerator = {
+            *(f"B01001e{number}" for number in range(20, 26)),
+            *(f"B01001e{number}" for number in range(44, 50)),
+        }
+        self.assertEqual(
+            set(age_metric["column_roles"]["numerator"]),
+            expected_numerator,
+        )
+        self.assertEqual(
+            age_metric["column_roles"]["denominator"],
+            ["B01001e1"],
+        )
+        self.assertEqual(len(age_metric["required_columns"]), 13)
+        self.assertTrue(age_metric["complete"])
+
+    def test_total_population_does_not_return_race_or_nearby_fields(self) -> None:
+        result = retrieve_schema(
+            "Compare the total population of California and Texas in 2020",
+            years=[2020],
+        )
+        identities = {
+            (column["table_name"], column["column_name"])
+            for column in result["columns"]
+        }
+        self.assertEqual(identities, {("2020_CBG_B01", "B01001e1")})
+        self.assertFalse(
+            any(table["table_name"] == "2020_CBG_B01001" for table in result["tables"])
+        )
+
+    def test_basic_population_uses_total_population_not_median_age(self) -> None:
+        result = retrieve_schema("What is the total population?", years=[2020])
+        self.assertEqual(
+            {
+                (column["table_name"], column["column_name"])
+                for column in result["columns"]
+            },
+            {("2020_CBG_B01", "B01001e1")},
+        )
+        self.assertFalse(result["physical_table_policy"]["indicator_ids_are_tables"])
 
 
 if __name__ == "__main__":

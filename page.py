@@ -66,21 +66,14 @@ def chat(
     # Exact successful history hits bypass Intent, Schema Retrieval, Snowflake,
     # and answer generation. The lookup is scoped to this user's JSONL file.
     # 成功历史问题完全命中时直接复用回答，并且检索范围仅限当前用户的 JSONL。
-    cached_record = None
-    if not pending_list:
-        try:
-            cached_record = history_service.find_exact_completed_record(
-                username,
-                user_input,
-            )
-        except (OSError, ValueError):
-            # Cache lookup is an optimization. A damaged/unavailable history
-            # index must not prevent the normal guarded chat pipeline.
-            # 历史命中仅是优化；读取失败时继续执行正常受保护的聊天流程。
-            LOGGER.exception(
-                "Unable to search reusable history for user=%s",
-                username,
-            )
+    cached_record = (
+        history_service.find_exact_completed_record(
+            history_records,
+            user_input,
+        )
+        if not pending_list
+        else None
+    )
     if cached_record is not None:
         pending_list.clear()
         final_record = history_service.build_history_record(

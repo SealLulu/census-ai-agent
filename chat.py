@@ -26,8 +26,10 @@ CHAT_STATUS_INVALID = -1
 ProgressCallback = Callable[[int, str], None]
 LOGGER = logging.getLogger(__name__)
 DATA_QUERY_ERROR_TEXT = (
-    "The Census data query failed. Please try again later."
+    "The Census data service encountered an issue. "
+    "Please try rephrasing your question or ask a different Census question."
 )
+DATA_SERVICE_UNAVAILABLE_TEXT = DATA_QUERY_ERROR_TEXT
 
 
 @dataclass(frozen=True)
@@ -134,6 +136,26 @@ def run_chat_flow(
             ),
         )
 
+    unsupported_geographies = schema_context.get("unsupported_geographies", [])
+    if unsupported_geographies:
+        LOGGER.info(
+            "Unsupported Census geography requested: %s",
+            unsupported_geographies,
+        )
+        return ChatFlowResult(
+            status=CHAT_STATUS_VALID,
+            intent_status=intent_result.status,
+            sql="",
+            sql_response="",
+            resolution=intent_result.resolution,
+            rewritten_question=intent_result.standalone_question,
+            direct_response=(
+                "City-level Census queries are not currently supported because "
+                "a verified city-to-Census-block-group mapping is unavailable. "
+                "Please ask about a supported state or county."
+            ),
+        )
+
     # Step 3: generate schema-grounded SQL. It is still not executed here.
     # 第三步：基于检索结果生成 SQL；此时仍未执行。
     generated_sql = sql_agent.generate_sql(
@@ -155,10 +177,7 @@ def run_chat_flow(
             sql_response="",
             resolution=intent_result.resolution,
             rewritten_question=intent_result.standalone_question,
-            direct_response=(
-                "The available Census schema is insufficient to answer this "
-                "question."
-            ),
+            direct_response=DATA_SERVICE_UNAVAILABLE_TEXT,
         )
 
     # Step 4: validation occurs inside the connector before Snowflake execution.

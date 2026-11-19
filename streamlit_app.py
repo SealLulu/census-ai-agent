@@ -20,9 +20,11 @@ import logging
 import streamlit as st
 
 from cold_start import AppConfig, initialize_application
+from logger import setup_logger
 from page import chat, load_history
 from services.history_service import (
     get_pending_list,
+    latest_history_activity,
     merge_refreshed_records,
     records_to_display_messages,
 )
@@ -102,25 +104,23 @@ def render_login(config: AppConfig) -> bool:
         st.error("This username is not allowed to access the chat.")
         return False
 
-    if not acquire_user_session(
-        username, st.session_state.browser_session_id
-    ):
-        st.error(
-            "This user is already logged in from another browser session. "
-            "Please log out there first."
-        )
-        return False
-
     try:
         records = load_history(username, config.chat_history_load_limit)
     except (OSError, ValueError):
-        # Loading failed after ownership was acquired, so release it immediately.
-        # 获取登录权后加载失败，需要立即释放该用户名。
-        release_user_session(
-            username, st.session_state.browser_session_id
-        )
         LOGGER.exception("Unable to load chat history for user=%s", username)
         st.error("Unable to load chat history. Please try again.")
+        return False
+
+    if not acquire_user_session(
+        username,
+        st.session_state.browser_session_id,
+        last_history_activity=latest_history_activity(records),
+    ):
+        st.error(
+            "This user is already logged in from another browser session. "
+            "Please log out there first or try again after 10 minutes of "
+            "inactivity."
+        )
         return False
 
     st.session_state.username = username
@@ -256,6 +256,7 @@ def render_chat_page(config: AppConfig) -> None:
 
 def main() -> None:
     """Start the validated Streamlit app. / 启动完成配置校验的 Streamlit 应用。"""
+    setup_logger()
     st.set_page_config(
         page_title=PAGE_TITLE,
         page_icon="📊",
