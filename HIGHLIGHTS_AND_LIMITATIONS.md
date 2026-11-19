@@ -59,9 +59,9 @@
 
 1. **Free-model reliability**
 
-   - **Constraint:** The free Gemini tier can be affected by demand spikes, quotas, timeouts, limited context, and inconsistent instruction or structured-output compliance. A complete question may require separate Intent, Text-to-SQL, and Answer calls, increasing this exposure.
-   - **Current mitigation:** The application uses bounded model fallback, classified error handling, structured-result validation, local Schema Retrieval, fail-closed decisions, and stage-aware recovery instead of silently accepting malformed output or restarting the entire pipeline.
-   - **Future plan:** Move critical stages to models with stable capacity, select models independently by task, build a repeatable accuracy and instruction-compliance evaluation set, and replace more common decisions with deterministic logic where appropriate.
+   - **Constraint:** The free Gemini tier can be affected by demand spikes, quotas, timeouts, limited context, and inconsistent instruction or structured-output compliance. OpenAI models were evaluated during development, but paid API access was not available in the project environment, so the deployed implementation currently supports only Gemini. A complete question may require separate Intent, Text-to-SQL, and Answer calls, increasing this exposure to one provider.
+   - **Current mitigation:** Gemini access is centralized in the LLM service, which applies bounded model fallback, classified error handling, and separate complete-response and streaming paths. Structured-result validation, local Schema Retrieval, fail-closed decisions, and stage-aware recovery prevent provider instability from silently producing malformed output or restarting the entire pipeline.
+   - **Future plan:** Introduce a provider-neutral LLM adapter and support multiple providers and model classes when budget and API access permit. Route Intent, Text-to-SQL, and Answer tasks independently, then select models using repeatable accuracy, instruction-compliance, latency, availability, and cost evaluations rather than relying on one default model.
 
 2. **Limited city-level geography support**
 
