@@ -55,6 +55,19 @@ not added or removed here.
 
 ## Authentication and Session Lifecycle / 身份验证与会话生命周期
 
+- Replace the current conservative single-session/single-active-chat policy with
+  isolated multi-chat session state. The present single-instance deployment keeps
+  login and processing locks in local memory; because of delivery-time constraints
+  and the risk of cross-session state contamination, one user is currently limited
+  to one browser session and one active `chat_id`. A future implementation should
+  use a composite identity such as `user_id + browser_id + session_id`, then maintain
+  a per-identity in-memory map of multiple `chat_id` states with independent locks,
+  pending context, lifecycle cleanup, and history synchronization.
+  / 将当前保守的“单会话、单活跃聊天”策略升级为隔离的多聊天会话状态。当前为单实例
+  部署，登录状态和处理锁均缓存在本地内存；受交付时间限制，并为降低跨会话数据污染
+  风险，目前限制一个用户只能拥有一个浏览器会话和一个活跃 `chat_id`。后续可使用
+  `user_id + browser_id + session_id` 复合标识，在内存中按该标识维护多个 `chat_id`
+  状态，并分别管理锁、pending 上下文、生命周期清理及历史同步。
 - Replace username-only login with a real identity provider or password-based login.
 - Add heartbeat, expiry, disconnect cleanup, and administrator unlock for stale sessions.
 - Replace the in-memory online-user registry with shared storage before multi-instance deployment.

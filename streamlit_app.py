@@ -57,6 +57,13 @@ def initialize_session_state() -> None:
         # receives an isolated in-memory clarification chain.
         # Streamlit 会话状态属于单个浏览器会话，因此每个用户拥有独立的待澄清链。
         st.session_state.pending_list = []
+    if "chat_processing" not in st.session_state:
+        # This per-browser lock prevents a user from submitting another message
+        # while the current Agent workflow is still running.
+        # 该浏览器会话锁用于阻止用户在当前 Agent 流程运行时再次提交问题。
+        st.session_state.chat_processing = False
+    if "queued_user_input" not in st.session_state:
+        st.session_state.queued_user_input = None
 
 
 def render_page_header() -> None:
@@ -120,6 +127,8 @@ def render_login(config: AppConfig) -> bool:
     st.session_state.chat_records = records
     st.session_state.active_chat_ids = set()
     st.session_state.pending_list = get_pending_list(records)
+    st.session_state.chat_processing = False
+    st.session_state.queued_user_input = None
     login_area.empty()
     return True
 
@@ -171,6 +180,8 @@ def render_chat_page(config: AppConfig) -> None:
         st.session_state.chat_records = []
         st.session_state.active_chat_ids = set()
         st.session_state.pending_list = []
+        st.session_state.chat_processing = False
+        st.session_state.queued_user_input = None
         st.rerun()
 
     render_page_header()
@@ -179,28 +190,68 @@ def render_chat_page(config: AppConfig) -> None:
         config.chat_history_load_limit,
     )
 
-    user_input = st.chat_input("Ask a question")
-    if not user_input:
+    # The first rerun stores one submitted question and redraws this widget as
+    # disabled before any slow Agent or Snowflake call begins.
+    # 第一次重跑先保存已提交问题，并在耗时的 Agent 或 Snowflake 调用前将输入框置灰。
+    submitted_input = st.chat_input(
+        (
+            "Processing the current question..."
+            if st.session_state.chat_processing
+            else "Ask a question"
+        ),
+        disabled=st.session_state.chat_processing,
+        submit_mode="disable",
+    )
+    if submitted_input:
+        # Server-side guard in addition to the disabled widget. It prevents a
+        # stale or duplicated browser event from replacing the active request.
+        # 除置灰输入框外再做服务端检查，防止过期或重复事件覆盖当前请求。
+        if st.session_state.chat_processing:
+            st.warning(
+                "Please wait for the current question to finish before "
+                "submitting another one."
+            )
+            return
+        st.session_state.queued_user_input = submitted_input
+        st.session_state.chat_processing = True
+        st.rerun()
+
+    if not st.session_state.chat_processing:
         return
+
+    user_input = st.session_state.queued_user_input
+    if not isinstance(user_input, str) or not user_input.strip():
+        # Recover from incomplete session state instead of leaving the input
+        # permanently disabled.
+        # 会话状态不完整时自动释放锁，避免输入框永久置灰。
+        st.session_state.chat_processing = False
+        st.session_state.queued_user_input = None
+        st.rerun()
 
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    result = chat(
-        # Intent and SQL use complete responses; only Answer streams. A bounded
-        # client timeout prevents failed Agent calls from hanging the page.
-        # Intent 和 SQL 使用完整响应，仅 Answer 流式返回；超时限制避免页面长期挂起。
-        client=create_gemini_client(config.gemini_api_key),
-        username=st.session_state.username,
-        user_input=user_input,
-        history_records=st.session_state.chat_records,
-        snowflake_config=config.snowflake,
-    )
-    if result is not None:
-        # Full rerun moves the just-streamed chat into the refreshed history
-        # fragment, preventing duplicate bubbles on the next timed refresh.
-        # 完整重跑会把刚输出的聊天移入历史片段，避免下次定时刷新时重复显示。
-        st.rerun()
+    try:
+        chat(
+            # Intent and SQL use complete responses; only Answer streams. A bounded
+            # client timeout prevents failed Agent calls from hanging the page.
+            # Intent 和 SQL 使用完整响应，仅 Answer 流式返回；超时限制避免页面长期挂起。
+            client=create_gemini_client(config.gemini_api_key),
+            username=st.session_state.username,
+            user_input=user_input,
+            history_records=st.session_state.chat_records,
+            snowflake_config=config.snowflake,
+        )
+    finally:
+        # Always release the user-level processing lock, including handled model
+        # or Snowflake failures, so the input becomes available again.
+        # 无论正常完成还是模型、Snowflake 异常，都释放用户级处理锁。
+        st.session_state.chat_processing = False
+        st.session_state.queued_user_input = None
+
+    # Full rerun moves the completed chat into history and redraws an enabled
+    # input widget. / 完整重跑将聊天移入历史并重新启用输入框。
+    st.rerun()
 
 
 def main() -> None:
@@ -231,6 +282,8 @@ def main() -> None:
         st.session_state.chat_records = []
         st.session_state.active_chat_ids = set()
         st.session_state.pending_list = []
+        st.session_state.chat_processing = False
+        st.session_state.queued_user_input = None
         st.error(
             "This user is already logged in from another browser session."
         )
@@ -247,6 +300,8 @@ def main() -> None:
         st.session_state.chat_records = []
         st.session_state.active_chat_ids = set()
         st.session_state.pending_list = []
+        st.session_state.chat_processing = False
+        st.session_state.queued_user_input = None
 
     if not st.session_state.username:
         if not render_login(config):

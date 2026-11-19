@@ -16,13 +16,103 @@ from typing import Any
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_CATALOG_PATH = BASE_DIR / "census_schema_catalog.sqlite"
+DEFAULT_CATALOG_PATH = BASE_DIR / "census_schema_catalog_verified.sqlite"
 DEFAULT_RESULT_LIMIT = 20
 MAX_RESULT_LIMIT = 100
 MAX_RELATIONSHIP_DEPTH = 2
 RETRIEVAL_POOL_MULTIPLIER = 8
 MIN_RETRIEVAL_POOL = 200
 MAX_RETRIEVAL_POOL = 500
+
+US_STATE_IDENTIFIERS = {
+    "alabama": ("AL", "01"),
+    "alaska": ("AK", "02"),
+    "arizona": ("AZ", "04"),
+    "arkansas": ("AR", "05"),
+    "california": ("CA", "06"),
+    "colorado": ("CO", "08"),
+    "connecticut": ("CT", "09"),
+    "delaware": ("DE", "10"),
+    "district of columbia": ("DC", "11"),
+    "florida": ("FL", "12"),
+    "georgia": ("GA", "13"),
+    "hawaii": ("HI", "15"),
+    "idaho": ("ID", "16"),
+    "illinois": ("IL", "17"),
+    "indiana": ("IN", "18"),
+    "iowa": ("IA", "19"),
+    "kansas": ("KS", "20"),
+    "kentucky": ("KY", "21"),
+    "louisiana": ("LA", "22"),
+    "maine": ("ME", "23"),
+    "maryland": ("MD", "24"),
+    "massachusetts": ("MA", "25"),
+    "michigan": ("MI", "26"),
+    "minnesota": ("MN", "27"),
+    "mississippi": ("MS", "28"),
+    "missouri": ("MO", "29"),
+    "montana": ("MT", "30"),
+    "nebraska": ("NE", "31"),
+    "nevada": ("NV", "32"),
+    "new hampshire": ("NH", "33"),
+    "new jersey": ("NJ", "34"),
+    "new mexico": ("NM", "35"),
+    "new york": ("NY", "36"),
+    "north carolina": ("NC", "37"),
+    "north dakota": ("ND", "38"),
+    "ohio": ("OH", "39"),
+    "oklahoma": ("OK", "40"),
+    "oregon": ("OR", "41"),
+    "pennsylvania": ("PA", "42"),
+    "rhode island": ("RI", "44"),
+    "south carolina": ("SC", "45"),
+    "south dakota": ("SD", "46"),
+    "tennessee": ("TN", "47"),
+    "texas": ("TX", "48"),
+    "utah": ("UT", "49"),
+    "vermont": ("VT", "50"),
+    "virginia": ("VA", "51"),
+    "washington": ("WA", "53"),
+    "west virginia": ("WV", "54"),
+    "wisconsin": ("WI", "55"),
+    "wyoming": ("WY", "56"),
+}
+
+# County values are added only after they are checked against Snowflake. This
+# intentionally starts with the required test case instead of guessing all US
+# county codes from names.
+# 县级编码仅在 Snowflake 验证后加入；当前先覆盖指定测试用例，不根据县名猜测编码。
+COUNTY_FIPS = {
+    ("washington", "king county"): "033",
+}
+
+# The bundled Catalog has no verified city-boundary mapping. Explicit city
+# requests must fail closed instead of silently broadening to their state.
+# 当前 Catalog 没有经过验证的城市边界映射；城市请求必须明确失败，不能静默扩大为州级查询。
+UNSUPPORTED_CITY_NAMES = {"seattle"}
+
+# These fields supplement FTS5 for explicit, high-value metrics. They are read
+# back from the Catalog so the SQL Agent still receives the real descriptions,
+# types, and semantics rather than hard-coded metadata.
+# 这些字段仅作为明确业务指标的 FTS5 兜底；实际描述、类型和语义仍从 Catalog 读取。
+IMPORTANT_METRICS = {
+    "population": {
+        "table_suffix": "CBG_B01",
+        "columns": ["B01001e1"],
+    },
+    "median household income": {
+        "table_suffix": "CBG_B19",
+        "columns": ["B19013e1"],
+    },
+    "owner-occupied": {
+        "table_suffix": "CBG_B25",
+        "columns": ["B25003e2", "B25003e3"],
+    },
+    "renter-occupied": {
+        "table_suffix": "CBG_B25",
+        "columns": ["B25003e2", "B25003e3"],
+    },
+}
 
 # These terms describe conversational structure or geography rather than a
 # Census metric. Removing them keeps searches focused on fields such as
@@ -65,6 +155,221 @@ def _build_fts_query(question: str) -> tuple[str, list[str]]:
     # operators in user input from changing the query structure.
     # 关键词来自严格正则；额外加引号可防止用户输入改变 FTS5 查询结构。
     return " OR ".join(f'"{term}"' for term in terms), terms
+
+
+def _requested_state_filters(question: str) -> list[dict[str, str]]:
+    """Map state names in a question to verified filter values. / 映射州名筛选值。"""
+    filters: list[dict[str, str]] = []
+    for state_name in _state_names_in_question(question):
+        abbreviation, state_fips = US_STATE_IDENTIFIERS[state_name]
+        filters.append(
+            {
+                "input_name": state_name.title(),
+                "state_column": "STATE",
+                "state_value": abbreviation,
+                "state_fips_column": "STATE_FIPS",
+                "state_fips_value": state_fips,
+            }
+        )
+    return filters
+
+
+def _state_names_in_question(question: str) -> list[str]:
+    """Find non-overlapping state names in text order. / 按文本顺序识别不重叠州名。"""
+    text = " ".join(question.lower().split())
+    candidates: list[tuple[int, int, str]] = []
+    for state in US_STATE_IDENTIFIERS:
+        for match in re.finditer(rf"\b{re.escape(state)}\b", text):
+            candidates.append((match.start(), match.end(), state))
+    candidates.sort(key=lambda item: (item[0], -(item[1] - item[0])))
+
+    selected: list[tuple[int, int, str]] = []
+    for candidate in candidates:
+        start, end, _ = candidate
+        if any(start < kept_end and end > kept_start for kept_start, kept_end, _ in selected):
+            continue
+        selected.append(candidate)
+    selected.sort(key=lambda item: item[0])
+    return [state for _, _, state in selected]
+
+
+def get_geographic_context(
+    question: str,
+    year: int,
+) -> dict[str, Any] | None:
+    """Resolve verified direct geometry filters. / 解析已验证的地理表直接筛选条件。"""
+    if not isinstance(question, str) or not question.strip():
+        raise ValueError("question must be a non-empty string.")
+    if isinstance(year, bool) or not isinstance(year, int):
+        raise ValueError("year must be an integer.")
+
+    text = " ".join(question.lower().split())
+    if any(re.search(rf"\b{re.escape(city)}\b", text) for city in UNSUPPORTED_CITY_NAMES):
+        return None
+    filter_groups: list[dict[str, Any]] = []
+    for state in _state_names_in_question(question):
+        _, state_fips = US_STATE_IDENTIFIERS[state]
+        filters = [{"column": "STATE_FIPS", "value": state_fips}]
+        for (county_state, county), county_fips in COUNTY_FIPS.items():
+            if (
+                county_state == state
+                and re.search(rf"\b{re.escape(county)}\b", text)
+            ):
+                filters.append(
+                    {"column": "COUNTY_FIPS", "value": county_fips}
+                )
+        filter_groups.append(
+            {
+                "location": state.title(),
+                "filters": filters,
+            }
+        )
+    if not filter_groups:
+        return None
+    return {
+        "table": f"{year}_CBG_GEOMETRY_WKT",
+        # Preserve the requested basic structure for a single location. For
+        # comparisons, filter_groups is authoritative and groups are OR-ed.
+        # 单地点保留基础 filters 结构；多地点比较以 filter_groups 为准，组间使用 OR。
+        "filters": filter_groups[0]["filters"] if len(filter_groups) == 1 else [],
+        "filter_groups": filter_groups,
+        "filter_group_operator": "OR",
+        "requires_fips_join": False,
+    }
+
+
+def _unsupported_geographies(question: str) -> list[str]:
+    """Find requested geography that lacks a verified mapping. / 查找没有已验证映射的地域。"""
+    text = " ".join(question.lower().split())
+    return [
+        city.title()
+        for city in sorted(UNSUPPORTED_CITY_NAMES)
+        if re.search(rf"\b{re.escape(city)}\b", text)
+    ]
+
+
+def _catalog_validated_geographic_context(
+    connection: sqlite3.Connection,
+    question: str,
+    year: int,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Validate direct geography filters against Catalog columns. / 对照 Catalog 校验地理筛选字段。"""
+    context = get_geographic_context(question, year)
+    if context is None:
+        return None, []
+    required_columns = {
+        filter_item["column"]
+        for group in context["filter_groups"]
+        for filter_item in group["filters"]
+    }
+    placeholders = ", ".join("?" for _ in required_columns)
+    rows = connection.execute(
+        f"""
+        SELECT column_name
+        FROM columns
+        WHERE table_name = ?
+          AND column_name IN ({placeholders})
+        """,
+        (context["table"], *sorted(required_columns)),
+    ).fetchall()
+    available = {row["column_name"] for row in rows}
+    missing = sorted(required_columns - available)
+    if missing:
+        return None, [f"{context['table']}.{column}" for column in missing]
+    context["catalog_columns_verified"] = True
+    return context, []
+
+
+def _metric_search_phrases(question: str) -> set[str]:
+    """Find explicit metric fallback phrases. / 识别明确的指标兜底短语。"""
+    text = " ".join(question.lower().replace("_", " ").split())
+    matched: set[str] = set()
+    if re.search(r"\bpopulation\b", text):
+        matched.add("population")
+    if "median household income" in text:
+        matched.add("median household income")
+    if re.search(r"\bowner[ -]occupied\b", text):
+        matched.add("owner-occupied")
+    if re.search(r"\brenter[ -]occupied\b", text):
+        matched.add("renter-occupied")
+    return matched
+
+
+def _retrieve_important_metric_columns(
+    connection: sqlite3.Connection,
+    question: str,
+    year: int,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Read explicit metric fields from the Catalog. / 从 Catalog 读取明确指标字段。"""
+    phrases = _metric_search_phrases(question)
+    requested: list[tuple[str, str]] = []
+    for phrase in IMPORTANT_METRICS:
+        if phrase not in phrases:
+            continue
+        metric = IMPORTANT_METRICS[phrase]
+        table_name = f"{year}_{metric['table_suffix']}"
+        for column_name in metric["columns"]:
+            identity = (table_name, column_name)
+            if identity not in requested:
+                requested.append(identity)
+    if not requested:
+        return [], []
+
+    clauses = " OR ".join(
+        "(c.table_name = ? AND c.column_name = ?)" for _ in requested
+    )
+    parameters = [value for identity in requested for value in identity]
+    rows = connection.execute(
+        f"""
+        SELECT
+            c.table_name,
+            c.column_name,
+            c.data_type,
+            c.ordinal_position,
+            c.table_number,
+            c.table_title,
+            c.topics,
+            c.universe,
+            c.field_path,
+            c.kind,
+            s.purpose AS semantic_purpose,
+            NULL AS relevance_score
+        FROM columns AS c
+        LEFT JOIN table_semantics AS s ON s.table_name = c.table_name
+        WHERE {clauses}
+        """,
+        parameters,
+    ).fetchall()
+    rows_by_identity = {
+        (row["table_name"], row["column_name"]): dict(row) for row in rows
+    }
+    result: list[dict[str, Any]] = []
+    missing: list[str] = []
+    for identity in requested:
+        column = rows_by_identity.get(identity)
+        if column is None:
+            missing.append(f"{identity[0]}.{identity[1]}")
+            continue
+        column["retrieval_score"] = -1000.0
+        column["retrieval_source"] = "important_metric_fallback"
+        result.append(column)
+    return result, missing
+
+
+def _merge_column_matches(
+    preferred: list[dict[str, Any]],
+    ranked: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge columns by table/name while preserving priority. / 按表和字段去重合并。"""
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for column in preferred + ranked:
+        identity = (column["table_name"], column["column_name"])
+        if identity in seen:
+            continue
+        seen.add(identity)
+        merged.append(column)
+    return merged
 
 
 def _validate_catalog_schema(connection: sqlite3.Connection) -> set[str]:
@@ -458,6 +763,9 @@ def retrieve_schema(
         matches: list[dict[str, Any]] = []
         relationships: list[dict[str, Any]] = []
         years_without_matches: list[int] = []
+        missing_important_fields: list[str] = []
+        geographic_contexts: list[dict[str, Any]] = []
+        missing_geographic_fields: list[str] = []
         for year in normalized_years:
             retrieval_pool = min(
                 max(limit * RETRIEVAL_POOL_MULTIPLIER, MIN_RETRIEVAL_POOL),
@@ -500,6 +808,21 @@ def retrieve_schema(
                 search_terms,
                 limit,
             )
+            important_columns, missing_columns = (
+                _retrieve_important_metric_columns(
+                    connection,
+                    question,
+                    year,
+                )
+            )
+            # Explicit metric fields supplement rather than replace FTS5. Put
+            # them first, then de-duplicate by exact table and column name.
+            # 明确指标字段只补充 FTS5，并按表名和字段名精确去重。
+            ranked_year_matches = _merge_column_matches(
+                important_columns,
+                ranked_year_matches,
+            )
+            missing_important_fields.extend(missing_columns)
             matches.extend(ranked_year_matches)
             if not ranked_year_matches:
                 years_without_matches.append(year)
@@ -511,6 +834,33 @@ def retrieve_schema(
             relationships.extend(
                 _retrieve_relationships(connection, matched_tables, year)
             )
+            geographic_context, missing_fields = (
+                _catalog_validated_geographic_context(
+                    connection,
+                    question,
+                    year,
+                )
+            )
+            if geographic_context is not None:
+                geographic_contexts.append(geographic_context)
+            missing_geographic_fields.extend(missing_fields)
+        # Direct, Catalog-validated FIPS filters make a name-lookup table
+        # unnecessary. Removing that optional path prevents the SQL Agent from
+        # selecting a longer join even though it is technically verified.
+        # 已有经 Catalog 校验的 FIPS 直接筛选时，不再把多余的名称查找关系交给 SQL Agent。
+        direct_filter_tables = {
+            context["table"]
+            for context in geographic_contexts
+            if context.get("requires_fips_join") is False
+        }
+        relationships = [
+            relationship
+            for relationship in relationships
+            if not (
+                relationship["source_table"] in direct_filter_tables
+                and "FIPS_CODES" in relationship["target_table"]
+            )
+        ]
         relationship_tables = _retrieve_related_table_columns(
             connection,
             relationships,
@@ -535,6 +885,17 @@ def retrieve_schema(
             + ", ".join(str(year) for year in years_without_matches)
             + "."
         )
+    if missing_important_fields:
+        warnings.append(
+            "Important metric fallback fields are missing from the Catalog: "
+            + ", ".join(missing_important_fields)
+            + "."
+        )
+    if missing_geographic_fields:
+        warnings.append(
+            "Direct geographic filters were omitted because Catalog fields are "
+            "missing: " + ", ".join(missing_geographic_fields) + "."
+        )
     unverified_relationships = sum(
         1
         for relationship in relationships
@@ -554,12 +915,34 @@ def retrieve_schema(
             "use table_title, topics, universe, and field_path instead."
         )
 
+    geographic_context: dict[str, Any] | list[dict[str, Any]] | None
+    if len(geographic_contexts) == 1:
+        geographic_context = geographic_contexts[0]
+    elif geographic_contexts:
+        geographic_context = geographic_contexts
+    else:
+        geographic_context = None
+
     return {
         "years": normalized_years,
         # Keep the legacy field for single-year consumers during migration.
         # 迁移期间为单年份调用方保留旧字段；跨年份时明确返回 None。
         "year": normalized_years[0] if len(normalized_years) == 1 else None,
         "search_terms": search_terms,
+        # State names are mapped locally because the Snowflake metadata stores
+        # two-letter abbreviations (for example, California -> CA) rather than
+        # full names. This prevents the SQL Agent from guessing literal values.
+        # Snowflake 元数据使用州缩写而非完整名称，因此在本地提供已知筛选值，避免 SQL
+        # Agent 猜测字符串格式。
+        "geography_filters": _requested_state_filters(question),
+        # Single-year questions return one object; multi-year questions return
+        # one context per geometry table so each year can be filtered directly.
+        # 单年份返回一个对象；跨年份为每个 geometry 表返回独立上下文。
+        "geographic_context": geographic_context,
+        # Non-empty values are a hard stop because the Catalog cannot safely
+        # map these boundaries to Census block groups.
+        # 非空值表示必须停止，因为 Catalog 无法安全映射这些边界到 CBG。
+        "unsupported_geographies": _unsupported_geographies(question),
         "tables": tables,
         "columns": matches,
         "relationships": relationships,

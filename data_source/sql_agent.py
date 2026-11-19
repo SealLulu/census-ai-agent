@@ -114,6 +114,23 @@ Rules:
     same metric is comparable across years. Never JOIN different years unless a
     verified cross-year relationship is provided.
 15. The reason and required_schema fields must always be written in English.
+16. When geographic_context provides verified geographic filters, apply their
+    exact column/value pairs directly to the specified CBG_GEOMETRY_WKT table.
+    Do not JOIN METADATA_CBG_FIPS_CODES merely to resolve a state or county
+    name when requires_fips_join is false. For a multi-year context list, apply
+    the matching geometry-table filters independently to each year. Within one
+    context, AND filters inside each filter_groups item and OR the groups when
+    filter_group_operator is OR. Never guess a geographic literal.
+    geography_filters is legacy compatibility context.
+17. Prefer the shortest verified JOIN path. Do not add a FIPS lookup table when
+    the required geographic filter can be applied directly to verified geometry
+    columns. Use only fields and relationships returned by Schema Retrieval.
+18. If unsupported_geographies is non-empty, return insufficient_schema rather
+    than silently broadening the request to a state or county.
+19. Respect each Census indicator's statistical meaning. Never SUM or AVG
+    medians, rates, or percentages to manufacture a state, county, or city value.
+    If an appropriate aggregate field or weighting method is not provided,
+    return insufficient_schema.
 """
 
 
