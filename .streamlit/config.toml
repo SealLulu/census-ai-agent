@@ -3,6 +3,11 @@
 
 [server]
 headless = true
+# Streamlit's module hot-reloader can evict a watched module from sys.modules
+# while Python is importing it, producing intermittent errors such as
+# KeyError: 'cold_start'. Cloud source updates use a deployment restart, so
+# production does not need an in-process source watcher.
+fileWatcherType = "none"
 
 [browser]
 gatherUsageStats = false

@@ -250,7 +250,9 @@ def load_snowflake_config() -> SnowflakeConfig:
 
     # Read each deployment value explicitly, following the same pattern as the
     # Gemini key. A valid Streamlit Secret always wins; only a missing or empty
-    # Secret falls back to the environment and then the local TOML file.
+    # Secret falls back to the environment and then the local TOML file. PATs
+    # are user-bound, so the deployment username must be overridable together
+    # with the token instead of coming from a tracked placeholder.
     # 与 Gemini Key 相同，逐项显式读取顶层 Streamlit Secrets。
     try:
         account = st.secrets["SNOWFLAKE_ACCOUNT"]
@@ -260,6 +262,15 @@ def load_snowflake_config() -> SnowflakeConfig:
         account = os.getenv("SNOWFLAKE_ACCOUNT")
     if not account:
         account = local_section.get("account")
+
+    try:
+        user = st.secrets["SNOWFLAKE_USER"]
+    except (KeyError, FileNotFoundError):
+        user = None
+    if not user:
+        user = os.getenv("SNOWFLAKE_USER")
+    if not user:
+        user = local_section.get("user")
 
     try:
         warehouse = st.secrets["SNOWFLAKE_WAREHOUSE"]
@@ -282,6 +293,7 @@ def load_snowflake_config() -> SnowflakeConfig:
     selected_values = dict(local_section)
     selected_values.update(
         account=account,
+        user=user,
         warehouse=warehouse,
         token=token,
     )
@@ -301,6 +313,10 @@ def load_snowflake_config() -> SnowflakeConfig:
                 f"SNOWFLAKE.{field} must be configured as a non-empty string."
             )
         normalized_value = value.strip()
+        if normalized_value.upper().startswith(("YOUR-", "YOUR_")):
+            raise ValueError(
+                f"SNOWFLAKE.{field} still contains a placeholder value."
+            )
         if field == "account":
             normalized_value = _normalize_snowflake_account(normalized_value)
             if not normalized_value:
@@ -332,6 +348,10 @@ def load_snowflake_config() -> SnowflakeConfig:
         raise ValueError(
             f"SNOWFLAKE.{credential_field} must be configured as a non-empty string "
             f"when auth_method is '{auth_method}'."
+        )
+    if credential.strip().upper().startswith(("YOUR-", "YOUR_")):
+        raise ValueError(
+            f"SNOWFLAKE.{credential_field} still contains a placeholder value."
         )
     values[credential_field] = credential.strip()
     values[

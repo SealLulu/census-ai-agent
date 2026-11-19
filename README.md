@@ -374,16 +374,19 @@ separately.
 
 On a server, Streamlit Secrets take priority for `GEMINI_API_KEY`,
 `ALLOWED_USERS`, and `CHAT_HISTORY_LOAD_LIMIT`. Snowflake accepts the top-level
-remote values `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_WAREHOUSE`, and
-`SNOWFLAKE_TOKEN`; each can also be supplied as an environment variable.
-Remaining Snowflake settings, and local fallbacks for those three values, come
-from `startup/snowflake.toml`.
+remote values `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`, `SNOWFLAKE_WAREHOUSE`, and
+`SNOWFLAKE_TOKEN`; each can also be supplied as an environment variable. A
+Programmatic Access Token is bound to its Snowflake user, so `SNOWFLAKE_USER`
+must identify the user that issued the configured token. Remaining Snowflake
+settings, and local fallbacks for these values, come from
+`startup/snowflake.toml`.
 
 Example Streamlit Secrets section:
 
 ```toml
 GEMINI_API_KEY = "YOUR_GEMINI_API_KEY"
 SNOWFLAKE_ACCOUNT = "YOUR_ORG-YOUR_ACCOUNT"
+SNOWFLAKE_USER = "YOUR_SNOWFLAKE_USER"
 SNOWFLAKE_WAREHOUSE = "COMPUTE_WH"
 SNOWFLAKE_TOKEN = "YOUR_PROGRAMMATIC_ACCESS_TOKEN"
 ```

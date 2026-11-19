@@ -43,6 +43,7 @@ schema = "PUBLIC"
 """
         remote_secrets = {
             "SNOWFLAKE_ACCOUNT": "REMOTE-ACCOUNT",
+            "SNOWFLAKE_USER": "REMOTE_USER",
             "SNOWFLAKE_WAREHOUSE": "REMOTE_WH",
             "SNOWFLAKE_TOKEN": "REMOTE_TOKEN",
         }
@@ -53,9 +54,47 @@ schema = "PUBLIC"
             config = cold_start.load_snowflake_config()
 
         self.assertEqual(config.account, "REMOTE-ACCOUNT")
+        self.assertEqual(config.user, "REMOTE_USER")
         self.assertEqual(config.warehouse, "REMOTE_WH")
         self.assertEqual(config.token, "REMOTE_TOKEN")
+
+    def test_local_user_is_used_when_remote_user_is_absent(self) -> None:
+        local_toml = b"""[SNOWFLAKE]
+auth_method = "PROGRAMMATIC_ACCESS_TOKEN"
+account = "LOCAL-ACCOUNT"
+user = "LOCAL_USER"
+token = "LOCAL_TOKEN"
+warehouse = "LOCAL_WH"
+schema = "PUBLIC"
+"""
+        remote_secrets = {
+            "SNOWFLAKE_ACCOUNT": "REMOTE-ACCOUNT",
+            "SNOWFLAKE_WAREHOUSE": "REMOTE_WH",
+            "SNOWFLAKE_TOKEN": "REMOTE_TOKEN",
+        }
+        with (
+            patch("pathlib.Path.open", mock_open(read_data=local_toml)),
+            patch.object(cold_start.st, "secrets", remote_secrets),
+        ):
+            config = cold_start.load_snowflake_config()
+
         self.assertEqual(config.user, "LOCAL_USER")
+
+    def test_placeholder_user_fails_during_cold_start(self) -> None:
+        local_toml = b"""[SNOWFLAKE]
+auth_method = "PROGRAMMATIC_ACCESS_TOKEN"
+account = "LOCAL-ACCOUNT"
+user = "YOUR-USER_NAME"
+token = "LOCAL_TOKEN"
+warehouse = "LOCAL_WH"
+schema = "PUBLIC"
+"""
+        with (
+            patch("pathlib.Path.open", mock_open(read_data=local_toml)),
+            patch.object(cold_start.st, "secrets", {}),
+        ):
+            with self.assertRaisesRegex(ValueError, "placeholder"):
+                cold_start.load_snowflake_config()
 
 
 if __name__ == "__main__":
