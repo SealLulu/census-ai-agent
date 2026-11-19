@@ -86,3 +86,21 @@
    - **Constraint:** Per-user JSONL is inexpensive for a single-instance deployment but provides limited concurrency, recovery, indexing, and search. Only the latest 50 records enter the working context, and reusable answers currently require an exact normalized-text match.
    - **Current mitigation:** User-separated files, tail-only loading, `chat_id` deduplication, bounded pending state, and SQL-only checkpoint persistence keep state small and reduce cross-user or refresh-related contamination. Conservative exact matching avoids unsafe semantic cache hits.
    - **Future plan:** Move conversations, messages, Sessions, and checkpoints to a transactional database such as PostgreSQL; add pagination, backups, retention, full-text search, and optionally vector retrieval. Similar-answer reuse must also match structured attributes such as year, geography, metric, Catalog version, and data-source version rather than relying on embedding distance alone.
+
+6. **Single-pass Retrieval and SQL generation**
+
+   - **Constraint:** The current pipeline performs one bounded Schema Retrieval and Text-to-SQL attempt. Automatically widening the schema or correcting rejected SQL requires more than a retry: each correction policy must be evaluated against false-positive fields, invalid joins, non-additive metrics, latency, and query cost before it can be trusted in production.
+   - **Current mitigation:** Metric-group expansion, verified relationships, strict SQL validation, and fail-closed responses prioritize correctness when the first attempt lacks sufficient evidence. The application does not let a model bypass validation merely to increase its apparent answer rate.
+   - **Future plan:** Build a representative Census evaluation set, then introduce a strictly bounded retrieve-generate-validate correction loop. Expansion and correction decisions will be measured for answer coverage, SQL validity, statistical correctness, latency, and Snowflake cost before deployment.
+
+7. **Production identity and access management**
+
+   - **Constraint:** The current allowlisted username flow is suitable for a controlled evaluation deployment but is not a production identity system. Adding real authentication requires an external identity provider, secure token and cookie handling, account recovery, role policy, revocation, auditability, and deployment-specific security validation.
+   - **Current mitigation:** Access is limited to configured usernames; histories and pending state are isolated per user; and Session ownership prevents the same username from concurrently controlling multiple browser Sessions in the current single-instance environment.
+   - **Future plan:** Integrate an OAuth/OIDC identity provider and validate the complete login, logout, expiry, revocation, role, and recovery lifecycle. Authorization and audit behavior must be tested across browser restarts, service restarts, and multiple application instances before replacing the controlled-demo login.
+
+8. **Production observability and capacity controls**
+
+   - **Constraint:** Warning and error logs provide failure evidence, but production operation also requires trustworthy cross-stage telemetry, health signals, alert thresholds, retention policies, and capacity baselines. These cannot be completed responsibly without representative traffic and access to the deployed model and Snowflake usage metrics.
+   - **Current mitigation:** Failures are classified by subsystem, technical details remain server-side, queries and result sizes are bounded, and automated tests plus manual integration tests cover critical paths without logging credentials or returned Census rows.
+   - **Future plan:** Add correlation IDs, stage latency and error metrics, token and Snowflake consumption tracking, dependency health checks, per-user quotas, and alerts. Calibrate thresholds through load and failure-injection testing so monitoring reflects real service behavior instead of arbitrary limits.
