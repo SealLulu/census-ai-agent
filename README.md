@@ -186,6 +186,15 @@ connector release.
 
 Chat history is stored locally in `chat_history` using JSON Lines (`.jsonl`), with one complete Q&A record per line. Login loads only the latest `CHAT_HISTORY_LOAD_LIMIT` records. The directory is retained in Git through `.gitkeep`, while generated history files are ignored.
 
+Before calling the Intent Agent, the page searches the current user's complete
+JSONL file for an exactly matching original question (ignoring only leading and
+trailing whitespace). The latest completed `NEW` answer is reused immediately,
+including its rewritten question and data provenance, without calling Gemini or
+Snowflake again. Pending clarifications, follow-ups, invalid requests, technical
+error responses, and records without Snowflake data are never reused. Cache
+lookup is disabled while a clarification chain is pending, and users remain
+strictly isolated by their own history files.
+
 Each line uses this format:
 
 ```json

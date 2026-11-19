@@ -25,6 +25,7 @@ Functions / 包含函数:
 - generate_chat_id: Generate a unique chat ID. / 生成唯一聊天 ID。
 - load_history_records: Load the latest JSONL records. / 读取末尾历史记录。
 - append_history_record: Append one complete record. / 追加一条完整记录。
+- find_exact_completed_record: Find a reusable exact prior answer. / 查找可复用的完全一致历史回答。
 - build_history_record: Build a canonical record. / 构造标准记录。
 - records_to_model_messages: Convert records for Agents. / 转换为 Agent 历史消息。
 - records_to_display_messages: Convert records for the UI. / 转换为页面显示消息。
@@ -185,6 +186,60 @@ def append_history_record(username: str, record: dict[str, Any]) -> None:
     history_path = get_chat_history_path(username)
     with history_path.open("a", encoding="utf-8") as history_file:
         history_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def find_exact_completed_record(
+    username: str,
+    user_input: str,
+) -> dict[str, Any] | None:
+    """Return the latest successful record with exactly the same question.
+
+    返回原始问题完全一致的最近一条成功记录。仅忽略首尾空白；不会复用 pending、
+    非法、异常提示或缺少 Snowflake 数据的记录。
+    """
+    expected_text = user_input.strip()
+    if not expected_text:
+        return None
+
+    history_path = get_chat_history_path(username)
+    latest_match: dict[str, Any] | None = None
+    with history_path.open("r", encoding="utf-8") as history_file:
+        for line_number, line in enumerate(history_file, start=1):
+            raw_line = line.strip()
+            if not raw_line:
+                continue
+            try:
+                decoded = json.loads(raw_line)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"Invalid JSONL chat history for user '{username}'."
+                ) from error
+            if not isinstance(decoded, dict):
+                raise ValueError(
+                    f"Invalid chat history record for user '{username}'."
+                )
+            record = _normalize_legacy_record(
+                decoded,
+                username,
+                line_number,
+                raw_line,
+            )
+            if not _is_valid_record(record):
+                raise ValueError(
+                    f"Invalid chat history record for user '{username}'."
+                )
+            if (
+                record["text"].strip() == expected_text
+                and record["valid_status"] == VALID_STATUS_VALID
+                and record["response_status"] == RESPONSE_STATUS_NORMAL
+                and record["intent_status"] == INTENT_STATUS_NEW
+                and bool(record["response"].strip())
+                and bool(record["sql_resp"].strip())
+                and record["resolution"]
+                != RESOLUTION_NEEDS_CLARIFICATION
+            ):
+                latest_match = record
+    return latest_match
 
 
 def build_history_record(

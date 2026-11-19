@@ -61,8 +61,46 @@ def chat(
     # shared with another logged-in user, even though the server process is shared.
     # 以下容器属于当前浏览器的 Streamlit 会话，不会与其他登录用户共享。
     active_chat_ids: set[str] = st.session_state.active_chat_ids
-    active_chat_ids.add(chat_id)
     pending_list: list[dict[str, str]] = st.session_state.pending_list
+
+    # Exact successful history hits bypass Intent, Schema Retrieval, Snowflake,
+    # and answer generation. The lookup is scoped to this user's JSONL file.
+    # 成功历史问题完全命中时直接复用回答，并且检索范围仅限当前用户的 JSONL。
+    cached_record = None
+    if not pending_list:
+        try:
+            cached_record = history_service.find_exact_completed_record(
+                username,
+                user_input,
+            )
+        except (OSError, ValueError):
+            # Cache lookup is an optimization. A damaged/unavailable history
+            # index must not prevent the normal guarded chat pipeline.
+            # 历史命中仅是优化；读取失败时继续执行正常受保护的聊天流程。
+            LOGGER.exception(
+                "Unable to search reusable history for user=%s",
+                username,
+            )
+    if cached_record is not None:
+        pending_list.clear()
+        final_record = history_service.build_history_record(
+            chat_id=chat_id,
+            user_input=user_input,
+            valid_status=history_service.VALID_STATUS_VALID,
+            rewritten_question=cached_record["rewritten_question"],
+            response=cached_record["response"],
+            sql=cached_record["sql"],
+            sql_resp=cached_record["sql_resp"],
+            intent_status=history_service.INTENT_STATUS_NEW,
+            resolution=history_service.RESOLUTION_NONE,
+        )
+        history_service.append_history_record(username, final_record)
+        history_records.append(final_record)
+        with st.chat_message("assistant"):
+            st.markdown(final_record["response"])
+        return final_record
+
+    active_chat_ids.add(chat_id)
     latest_pending = pending_list[-1] if pending_list else {}
 
     # Keep a pending in-memory record so a timed refresh can identify this chat
