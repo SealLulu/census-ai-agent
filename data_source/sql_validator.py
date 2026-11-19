@@ -7,6 +7,7 @@ Functions / 包含函数:
 - validate_sql: Validate read-only scope, tables, columns, and joins. / 校验只读范围、表、字段与关联。
 """
 
+import re
 from typing import Any
 
 import sqlglot
@@ -89,6 +90,36 @@ def _relationship_column_names(value: Any) -> set[str]:
     }
 
 
+def _quote_allowed_year_tables(
+    sql: str,
+    allowed_tables: set[str],
+    database: str,
+    schema_name: str,
+) -> str:
+    """Quote only retrieved, fully qualified tables that start with a digit.
+
+    Snowflake requires year-prefixed physical table names to be quoted. This
+    deterministic repair is restricted to exact allowlisted table names; it
+    never makes an unknown model-generated table executable.
+    """
+    normalized = sql
+    database_part = rf'(?:"{re.escape(database)}"|{re.escape(database)})'
+    schema_part = rf'(?:"{re.escape(schema_name)}"|{re.escape(schema_name)})'
+    for table_name in sorted(allowed_tables, key=len, reverse=True):
+        if not table_name[:1].isdigit():
+            continue
+        pattern = re.compile(
+            rf"(?P<prefix>{database_part}\s*\.\s*{schema_part}\s*\.\s*)"
+            rf"{re.escape(table_name)}(?![A-Za-z0-9_$\"])",
+            flags=re.IGNORECASE,
+        )
+        normalized = pattern.sub(
+            lambda match: f'{match.group("prefix")}"{table_name}"',
+            normalized,
+        )
+    return normalized
+
+
 def _is_verified_join(
     join: exp.Join,
     alias_to_table: dict[str, str],
@@ -135,8 +166,15 @@ def validate_sql(
     if not isinstance(sql, str) or not sql.strip():
         return SQLValidationResult(is_valid=False, errors=["SQL is empty."])
 
+    allowed_tables, columns_by_table = _schema_permissions(schema_context)
+    sql_for_parsing = _quote_allowed_year_tables(
+        sql,
+        allowed_tables,
+        database,
+        schema_name,
+    )
     try:
-        statements = sqlglot.parse(sql, read="snowflake")
+        statements = sqlglot.parse(sql_for_parsing, read="snowflake")
     except ParseError as error:
         return SQLValidationResult(
             is_valid=False,
@@ -174,7 +212,6 @@ def validate_sql(
                     f"LIMIT must be between 1 and {MAX_SQL_RESULT_ROWS}."
                 )
 
-    allowed_tables, columns_by_table = _schema_permissions(schema_context)
     if not allowed_tables:
         errors.append("Schema context contains no allowed tables.")
 
@@ -214,6 +251,12 @@ def validate_sql(
                 )
         elif column_name not in all_allowed_columns:
             errors.append(f"Column is not present in retrieved schema: {column_name}.")
+        # Preserve exact mixed-case Census identifiers in the SQL sent to
+        # Snowflake. Unquoted identifiers would otherwise be uppercased.
+        if column_name in all_allowed_columns and any(
+            character.islower() for character in column_name
+        ):
+            column.this.set("quoted", True)
 
     # Candidate relationships are discovery metadata only. Execution requires a
     # Catalog relationship explicitly promoted to verification_status=verified.

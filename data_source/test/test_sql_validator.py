@@ -36,6 +36,19 @@ class SQLValidatorPhysicalTableTest(unittest.TestCase):
         )
         self.assertTrue(result.is_valid, result.errors)
 
+    def test_unquoted_year_table_is_safely_normalized(self) -> None:
+        result = validate_sql(
+            (
+                f"SELECT b.B01001e1 FROM {CENSUS_DATABASE}."
+                "PUBLIC.2020_CBG_B01 AS b LIMIT 10"
+            ),
+            self.schema_context,
+            CENSUS_DATABASE,
+        )
+        self.assertTrue(result.is_valid, result.errors)
+        self.assertIn('"2020_CBG_B01"', result.normalized_sql)
+        self.assertIn('"B01001e1"', result.normalized_sql)
+
     def test_indicator_id_cannot_be_used_as_table_suffix(self) -> None:
         result = validate_sql(
             (

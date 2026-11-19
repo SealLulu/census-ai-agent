@@ -94,7 +94,10 @@ Rules:
 1. Return one read-only SELECT query, or report insufficient_schema.
 2. Never invent tables, columns, joins, filters, or metric definitions.
 3. Use fully qualified table names: database.schema.table.
-4. Double-quote identifiers that start with digits or require quoting.
+4. Double-quote every exact table or column identifier that starts with a digit
+   or contains lowercase letters. In particular, a year-prefixed table must be
+   written as database.schema."2020_CBG_B01"; database.schema.2020_CBG_B01 is
+   invalid Snowflake SQL. Aliases may remain unquoted.
 5. Use exact table and column names from the provided schema context.
 6. JOIN tables only when the provided context verifies the relationship.
    A relationship is verified only when verification_status is exactly "verified".
@@ -148,7 +151,141 @@ Rules:
 25. aggregate_household_income with aggregation_semantics=additive_currency may
     be summed across non-overlapping block groups after applying the verified
     geography filter. Do not confuse it with median_household_income.
+26. The word "households" is a Census metric concept, not a county reference.
+    For a housing_tenure metric with additive_count_members, SUM the verified
+    owner-occupied and renter-occupied member columns independently. A state
+    filter such as STATE_FIPS='06' is complete by itself and never requires a
+    county-name lookup or METADATA_CBG_FIPS_CODES JOIN.
 """
+
+
+def _quoted_identifier(identifier: str) -> str:
+    """Quote one Catalog-provided Snowflake identifier. / 引用 Catalog 中的标识符。"""
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _verified_cbg_relationship(
+    schema_context: dict[str, Any],
+    metric_table: str,
+    geography_table: str,
+) -> bool:
+    """Require the exact verified CBG relationship. / 要求精确且已验证的 CBG 关系。"""
+    for relationship in schema_context.get("relationships", []):
+        if relationship.get("verification_status") != "verified":
+            continue
+        source_table = str(relationship.get("source_table", ""))
+        target_table = str(relationship.get("target_table", ""))
+        if {source_table, target_table} != {metric_table, geography_table}:
+            continue
+        source_columns = str(relationship.get("source_columns", ""))
+        target_columns = str(relationship.get("target_columns", ""))
+        if source_columns == target_columns == "CENSUS_BLOCK_GROUP":
+            return True
+    return False
+
+
+def _recover_complete_housing_tenure_query(
+    result: SQLResult,
+    schema_context: dict[str, Any],
+    schema_name: str,
+) -> SQLResult | None:
+    """Recover a fully specified tenure query rejected by an unstable model.
+
+    Recovery requires one complete housing-tenure metric, one Catalog-verified
+    direct geography context, and one verified CBG JOIN. It never guesses a
+    table, column, filter, or relationship.
+    / 仅在住房产权指标、地域字段和 CBG JOIN 均已验证时恢复模型误拒绝的查询。
+    """
+    if result.status != "insufficient_schema":
+        return None
+
+    metrics = schema_context.get("metrics", [])
+    if len(metrics) != 1:
+        return None
+    metric = metrics[0]
+    if (
+        metric.get("metric_id") != "housing_tenure"
+        or metric.get("aggregation_semantics") != "additive_count_members"
+        or metric.get("complete") is not True
+    ):
+        return None
+
+    metric_table = str(metric.get("physical_table", ""))
+    member_columns = metric.get("column_roles", {}).get("members", [])
+    if not metric_table or len(member_columns) != 2:
+        return None
+
+    catalog_columns = {
+        str(column.get("column_name", "")): column
+        for column in schema_context.get("columns", [])
+        if column.get("table_name") == metric_table
+    }
+    if not all(column in catalog_columns for column in member_columns):
+        return None
+    owner_columns = [
+        column
+        for column in member_columns
+        if "owner occupied"
+        in str(catalog_columns[column].get("field_path", "")).lower()
+    ]
+    renter_columns = [
+        column
+        for column in member_columns
+        if "renter occupied"
+        in str(catalog_columns[column].get("field_path", "")).lower()
+    ]
+    if len(owner_columns) != 1 or len(renter_columns) != 1:
+        return None
+
+    geography_context = schema_context.get("geographic_context")
+    if not isinstance(geography_context, dict):
+        return None
+    if (
+        geography_context.get("requires_fips_join") is not False
+        or geography_context.get("catalog_columns_verified") is not True
+    ):
+        return None
+    geography_table = str(geography_context.get("table", ""))
+    filter_groups = geography_context.get("filter_groups", [])
+    if not geography_table or len(filter_groups) != 1:
+        return None
+    filters = filter_groups[0].get("filters", [])
+    if not filters:
+        return None
+
+    geography_columns = {
+        str(column.get("column_name", ""))
+        for column in schema_context.get("relationship_tables", {}).get(
+            geography_table, []
+        )
+    }
+    if "CENSUS_BLOCK_GROUP" not in geography_columns:
+        return None
+    if any(str(item.get("column", "")) not in geography_columns for item in filters):
+        return None
+    if not _verified_cbg_relationship(
+        schema_context, metric_table, geography_table
+    ):
+        return None
+
+    where_terms: list[str] = []
+    for item in filters:
+        column = _quoted_identifier(str(item["column"]))
+        value = str(item["value"]).replace("'", "''")
+        where_terms.append(f"g.{column} = '{value}'")
+
+    owner_column = _quoted_identifier(owner_columns[0])
+    renter_column = _quoted_identifier(renter_columns[0])
+    sql = (
+        f"SELECT SUM(h.{owner_column}) AS owner_occupied_households, "
+        f"SUM(h.{renter_column}) AS renter_occupied_households "
+        f"FROM {CENSUS_DATABASE}.{schema_name}.{_quoted_identifier(metric_table)} AS h "
+        f"JOIN {CENSUS_DATABASE}.{schema_name}.{_quoted_identifier(geography_table)} AS g "
+        f"ON h.{_quoted_identifier('CENSUS_BLOCK_GROUP')} = "
+        f"g.{_quoted_identifier('CENSUS_BLOCK_GROUP')} "
+        f"WHERE {' AND '.join(where_terms)} LIMIT 1000"
+    )
+    return SQLResult(status="success", sql=sql)
 
 
 def generate_sql(
@@ -189,10 +326,16 @@ def generate_sql(
     )
     content = completion.text or ""
     try:
-        return SQLResult.model_validate_json(content)
+        result = SQLResult.model_validate_json(content)
     except ValidationError as error:
-        return SQLResult(
+        result = SQLResult(
             status="insufficient_schema",
             reason="The SQL Agent returned an invalid structured response.",
             required_schema=[str(error)],
         )
+    recovered = _recover_complete_housing_tenure_query(
+        result,
+        schema_context,
+        schema_name.strip(),
+    )
+    return recovered or result
