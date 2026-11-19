@@ -7,6 +7,7 @@ Explore US Census data through natural language with multi-agent intelligence.
 ```text
 streamlit_app.py       Streamlit UI, login, session state, and timed refresh
 cold_start.py          Configuration loading, validation, and user-file checks
+requirements.txt       Python dependencies for local and remote deployment
 page.py                Two page operations: load_history and chat
 chat.py                Main chat workflow
 TODO.md                Planned concurrency and deployment extensions
@@ -28,7 +29,6 @@ startup/
   local_config.toml    Local fallback application settings
   gemini_key.toml      Local Google Gemini API key
   snowflake.toml       Local Snowflake credentials
-  requirements.txt     Python dependencies
   start_win.ps1        Windows startup script
 
 .streamlit/
@@ -51,9 +51,10 @@ Each Python module starts with a bilingual summary and a list of the functions i
 
 After receiving text, `page.chat` renders transient progress at 5% before calling the Intent Agent. Intent and Text-to-SQL wait for complete, non-streamed structured responses. Requests that continue through the pipeline advance to 25% after Intent and 60% after the Snowflake data-source stage. Only the Answer Agent streams its response; after the stream completes the page reaches 100%, persists only the complete response, and reruns so refreshed history displays the complete message. Progress itself is never written to JSONL.
 
-All three Agents use Google Gemini's `gemini-3.8-flash` through the native
-Google Gen AI SDK. Intent and Text-to-SQL use JSON Schema-constrained complete
-outputs; Answer uses ordinary streaming output.
+All three Agents use `gemini-3.5-flash-lite` first and fall back to
+`gemini-3.6-flash` for temporary model, quota, timeout, or server failures.
+Intent and Text-to-SQL use complete JSON Schema outputs. Answer streams normally
+and changes models only when no response chunk has been displayed yet.
 
 `data_source.census_data_service.query_census_data` executes validated read-only `SELECT` statements against the Snowflake-hosted US Open Census Data & Neighborhood Insights - Free Dataset. It serializes the returned columns and rows as `data_input` for answer generation.
 

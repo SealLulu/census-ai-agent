@@ -13,10 +13,9 @@ from dataclasses import dataclass
 
 from google.genai import Client, types
 
-from services.llm_service import GEMINI_MODEL_NAME, to_gemini_contents
+from services.llm_service import generate_content_with_fallback, to_gemini_contents
 
 
-MODEL_NAME = GEMINI_MODEL_NAME
 STATUS_INVALID = "INVALID"
 STATUS_NEW = "NEW"
 STATUS_FOLLOW_UP = "FOLLOW_UP"
@@ -178,14 +177,16 @@ def detect_conversation_intent(
             ],
         )
     )
-    completion = client.models.generate_content(
-        model=MODEL_NAME,
+    completion = generate_content_with_fallback(
+        client,
         contents=contents,
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
             response_mime_type="application/json",
             response_json_schema=INTENT_RESPONSE_FORMAT["json_schema"]["schema"],
             temperature=0,
+            max_output_tokens=512,
+            automatic_continuation=False,
         ),
     )
 

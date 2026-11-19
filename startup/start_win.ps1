@@ -24,7 +24,10 @@ if (-not (Test-Path -LiteralPath $pythonPath)) {
 }
 
 Write-Host "Installing project dependencies..."
-& $pythonPath -m pip install -r (Join-Path $startupRoot "requirements.txt")
+& $pythonPath -m pip install -r (Join-Path $projectRoot "requirements.txt")
+if ($LASTEXITCODE -ne 0) {
+    throw "Dependency installation failed."
+}
 
 Write-Host "Starting Streamlit at http://127.0.0.1:8501 ..."
 & $pythonPath -m streamlit run (Join-Path $projectRoot "streamlit_app.py") `

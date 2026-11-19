@@ -15,10 +15,7 @@ from typing import Any
 
 from google.genai import Client, types
 
-from services.llm_service import GEMINI_MODEL_NAME, to_gemini_contents
-
-
-MODEL_NAME = GEMINI_MODEL_NAME
+from services.llm_service import stream_content_with_fallback, to_gemini_contents
 
 
 SYSTEM_PROMPT = """You are Census AI Assistant, a high-accuracy answer agent for
@@ -139,18 +136,13 @@ def generate_answer(
         )
     )
 
-    # Stream plain text chunks so Streamlit can render them incrementally.
-    # 仅输出纯文本分片，供 Streamlit 逐步渲染。
-    def stream_text() -> Any:
-        for chunk in client.models.generate_content_stream(
-            model=MODEL_NAME,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                temperature=0,
-            ),
-        ):
-            if chunk.text:
-                yield chunk.text
-
-    return stream_text()
+    return stream_content_with_fallback(
+        client,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            temperature=0,
+            max_output_tokens=1024,
+            automatic_continuation=False,
+        ),
+    )

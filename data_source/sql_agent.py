@@ -16,10 +16,8 @@ from google.genai import Client, types
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from data_source.census_data_service import CENSUS_DATABASE
-from services.llm_service import GEMINI_MODEL_NAME
+from services.llm_service import generate_content_with_fallback
 
-
-MODEL_NAME = GEMINI_MODEL_NAME
 
 SQL_RESPONSE_FORMAT = {
     "type": "json_schema",
@@ -137,8 +135,8 @@ def generate_sql(
     if not isinstance(schema_name, str) or not schema_name.strip():
         raise ValueError("schema_name must be a non-empty string.")
 
-    completion = client.models.generate_content(
-        model=MODEL_NAME,
+    completion = generate_content_with_fallback(
+        client,
         contents=(
             f"Question:\n{question.strip()}\n\n"
             "Retrieved schema context:\n"
@@ -151,6 +149,8 @@ def generate_sql(
             response_mime_type="application/json",
             response_json_schema=SQL_RESPONSE_FORMAT["json_schema"]["schema"],
             temperature=0,
+            max_output_tokens=2048,
+            automatic_continuation=False,
         ),
     )
     content = completion.text or ""
