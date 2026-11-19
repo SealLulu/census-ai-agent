@@ -11,10 +11,12 @@ Functions / 包含函数:
 import json
 from dataclasses import dataclass
 
-from openai import OpenAI
+from google.genai import Client, types
+
+from services.llm_service import GEMINI_MODEL_NAME, to_gemini_contents
 
 
-MODEL_NAME = "gpt-4o-mini"
+MODEL_NAME = GEMINI_MODEL_NAME
 STATUS_INVALID = "INVALID"
 STATUS_NEW = "NEW"
 STATUS_FOLLOW_UP = "FOLLOW_UP"
@@ -26,6 +28,40 @@ VALID_RESOLUTIONS = {
     RESOLUTION_NONE,
     RESOLUTION_NEEDS_CLARIFICATION,
     RESOLUTION_RESOLVED_PENDING,
+}
+
+INTENT_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "census_intent_result",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": [STATUS_INVALID, STATUS_NEW, STATUS_FOLLOW_UP],
+                },
+                "resolution": {
+                    "type": "string",
+                    "enum": [
+                        RESOLUTION_NONE,
+                        RESOLUTION_NEEDS_CLARIFICATION,
+                        RESOLUTION_RESOLVED_PENDING,
+                    ],
+                },
+                "standalone_question": {"type": "string"},
+                "response_text": {"type": "string"},
+            },
+            "required": [
+                "status",
+                "resolution",
+                "standalone_question",
+                "response_text",
+            ],
+            "additionalProperties": False,
+        },
+    },
 }
 
 
@@ -119,7 +155,7 @@ class IntentResult:
 
 
 def detect_conversation_intent(
-    client: OpenAI,
+    client: Client,
     history_messages: list[dict[str, str]],
     pending_list: list[dict[str, str]],
     user_input: str,
@@ -128,22 +164,32 @@ def detect_conversation_intent(
     if not isinstance(user_input, str) or not user_input.strip():
         return IntentResult(STATUS_INVALID, RESOLUTION_NONE, "", "")
     pending_context = json.dumps(pending_list, ensure_ascii=False)
-    completion = client.chat.completions.create(
+    contents = to_gemini_contents(history_messages)
+    contents.append(
+        types.Content(
+            role="user",
+            parts=[
+                types.Part.from_text(
+                    text=(
+                        f"Pending context: {pending_context}\n\n"
+                        f"Current user message: {user_input}"
+                    )
+                )
+            ],
+        )
+    )
+    completion = client.models.generate_content(
         model=MODEL_NAME,
-        response_format={"type": "json_object"},
-        messages=[
-            {
-                "role": "system",
-                "content": SYSTEM_PROMPT,
-            },
-            {"role": "system", "content": f"Pending context: {pending_context}"},
-            *history_messages,
-            {"role": "user", "content": user_input},
-        ],
-        temperature=0,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            response_mime_type="application/json",
+            response_json_schema=INTENT_RESPONSE_FORMAT["json_schema"]["schema"],
+            temperature=0,
+        ),
     )
 
-    content = completion.choices[0].message.content or ""
+    content = completion.text or ""
     try:
         result = json.loads(content)
     except (json.JSONDecodeError, TypeError):

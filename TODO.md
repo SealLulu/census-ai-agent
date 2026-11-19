@@ -30,7 +30,7 @@ not added or removed here.
 - Add a bounded correction loop when generated SQL fails validation.
 - Add cost controls such as warehouse limits, query-cost inspection, and per-user quotas.
 - Extend the validator for more verified aggregation semantics and geographic joins.
-- Add bounded retries for transient OpenAI and Snowflake failures while avoiding
+- Add bounded retries for transient Gemini and Snowflake failures while avoiding
   retries for validation or permission errors.
 
 ## History and Storage / 历史记录与存储
@@ -52,7 +52,7 @@ not added or removed here.
 
 - Add structured logs and correlation IDs across Intent, Retrieval, SQL, and Answer stages.
 - Record latency, token usage, validation failures, Snowflake query IDs, and result sizes.
-- Add health checks for the Schema Catalog, OpenAI API, and Snowflake connectivity.
+- Add health checks for the Schema Catalog, Gemini API, and Snowflake connectivity.
 - Add automated deployment checks without logging API keys, passwords, SQL results,
   or private conversation content.
 

@@ -9,10 +9,11 @@ Functions / 包含函数:
 """
 
 from dataclasses import dataclass
+import logging
 import re
 from typing import Any, Callable
 
-from openai import OpenAI
+from google.genai import Client
 
 from agents import answer_agent, intent_agent
 from cold_start import SnowflakeConfig
@@ -23,6 +24,7 @@ MAX_INTENT_HISTORY_MESSAGES = 10
 CHAT_STATUS_VALID = 0
 CHAT_STATUS_INVALID = -1
 ProgressCallback = Callable[[int, str], None]
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -42,7 +44,7 @@ class ChatFlowResult:
 
 
 def run_chat_flow(
-    client: OpenAI,
+    client: Client,
     user_input: str,
     history_messages: list[dict[str, str]],
     pending_list: list[dict[str, str]],
@@ -51,6 +53,11 @@ def run_chat_flow(
 ) -> ChatFlowResult:
     """Run intent, optional data query, and answer generation. / 执行意图、查询与生成。"""
     recent_history = history_messages[-MAX_INTENT_HISTORY_MESSAGES:]
+
+    # Acknowledge the received text before making the first Agent call.
+    # 在第一次调用 Agent 前先确认已收到当前文本。
+    if progress_callback:
+        progress_callback(5, "Request received")
 
     # Step 1: classify and rewrite the question; Intent never generates SQL.
     # 第一步：识别意图并补全问题；Intent 不再生成 SQL。
@@ -88,8 +95,8 @@ def run_chat_flow(
             pending_clarification=intent_result.response_text,
         )
 
-    # Progress is UI-only and begins only after Intent allows the data pipeline.
-    # 进度只用于页面展示；仅当 Intent 允许继续时才启动数据流程进度。
+    # Continue progress only when Intent allows the data pipeline.
+    # 仅当 Intent 允许继续时，才推进到后续数据流程进度。
     if progress_callback:
         progress_callback(25, "Intent complete")
 
@@ -109,7 +116,8 @@ def run_chat_flow(
             intent_result.standalone_question,
             years=schema_years,
         )
-    except (FileNotFoundError, ValueError) as error:
+    except (FileNotFoundError, ValueError):
+        LOGGER.exception("Unable to retrieve the required Census schema.")
         return ChatFlowResult(
             status=CHAT_STATUS_VALID,
             intent_status=intent_result.status,
@@ -117,7 +125,10 @@ def run_chat_flow(
             sql_response="",
             resolution=intent_result.resolution,
             rewritten_question=intent_result.standalone_question,
-            direct_response=f"Unable to retrieve the required Census schema: {error}",
+            direct_response=(
+                "The required Census schema is currently unavailable. "
+                "Please try again later."
+            ),
         )
 
     # Step 3: generate schema-grounded SQL. It is still not executed here.
@@ -129,8 +140,11 @@ def run_chat_flow(
         schema_name=snowflake_config.schema,
     )
     if generated_sql.status == "insufficient_schema":
-        missing = ", ".join(generated_sql.required_schema)
-        detail = f" Required schema: {missing}." if missing else ""
+        LOGGER.warning(
+            "SQL generation reported insufficient schema: reason=%s required=%s",
+            generated_sql.reason,
+            generated_sql.required_schema,
+        )
         return ChatFlowResult(
             status=CHAT_STATUS_VALID,
             intent_status=intent_result.status,
@@ -138,7 +152,10 @@ def run_chat_flow(
             sql_response="",
             resolution=intent_result.resolution,
             rewritten_question=intent_result.standalone_question,
-            direct_response=generated_sql.reason + detail,
+            direct_response=(
+                "The available Census schema is insufficient to answer this "
+                "question."
+            ),
         )
 
     # Step 4: validation occurs inside the connector before Snowflake execution.

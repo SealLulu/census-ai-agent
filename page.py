@@ -14,7 +14,7 @@ import logging
 from typing import Any
 
 import streamlit as st
-from openai import OpenAI
+from google.genai import Client
 
 import chat as chat_workflow
 from cold_start import SnowflakeConfig
@@ -22,7 +22,9 @@ from services import history_service
 
 
 LOGGER = logging.getLogger(__name__)
-SERVICE_ERROR_TEXT = "当前服务异常，请稍等~"
+SERVICE_ERROR_TEXT = (
+    "The service is currently unavailable. Please try again later."
+)
 
 
 def load_history(username: str, load_limit: int) -> list[dict[str, Any]]:
@@ -31,7 +33,7 @@ def load_history(username: str, load_limit: int) -> list[dict[str, Any]]:
 
 
 def chat(
-    client: OpenAI,
+    client: Client,
     username: str,
     user_input: str,
     history_records: list[dict[str, Any]],
@@ -62,9 +64,9 @@ def chat(
     )
     history_records.append(pending_record)
 
-    # The progress widget is created lazily only after Intent allows the request
-    # to enter the data pipeline. Progress is never persisted to JSONL.
-    # 仅当 Intent 允许进入数据流程后才创建进度条；进度状态不写入 JSONL。
+    # The progress widget is created lazily when the workflow acknowledges the
+    # received text at 5%. Progress is never persisted to JSONL.
+    # 工作流以 5% 确认收到文本时才创建进度条；进度状态不写入 JSONL。
     progress_bar: Any | None = None
 
     def render_progress(percent: int, label: str) -> None:

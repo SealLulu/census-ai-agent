@@ -15,8 +15,9 @@ Functions / 包含函数:
 - main: Start and route the application. / 启动并路由应用。
 """
 
+import logging
+
 import streamlit as st
-from openai import OpenAI
 
 from cold_start import AppConfig, initialize_application
 from page import chat, load_history
@@ -25,6 +26,7 @@ from services.history_service import (
     merge_refreshed_records,
     records_to_display_messages,
 )
+from services.llm_service import create_gemini_client
 from services.session_service import (
     acquire_user_session,
     generate_session_id,
@@ -37,6 +39,7 @@ PAGE_HEADING = "Census AI Assistant"
 PAGE_SUBTITLE = (
     "Explore US Census data through natural language with multi-agent intelligence."
 )
+LOGGER = logging.getLogger(__name__)
 
 
 def initialize_session_state() -> None:
@@ -103,13 +106,14 @@ def render_login(config: AppConfig) -> bool:
 
     try:
         records = load_history(username, config.chat_history_load_limit)
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError):
         # Loading failed after ownership was acquired, so release it immediately.
         # 获取登录权后加载失败，需要立即释放该用户名。
         release_user_session(
             username, st.session_state.browser_session_id
         )
-        st.error(f"Unable to load chat history: {error}")
+        LOGGER.exception("Unable to load chat history for user=%s", username)
+        st.error("Unable to load chat history. Please try again.")
         return False
 
     st.session_state.username = username
@@ -133,10 +137,14 @@ def render_history_fragment(username: str, load_limit: int) -> None:
         st.session_state.pending_list = get_pending_list(
             st.session_state.chat_records
         )
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError):
         # A refresh failure does not discard the already loaded session history.
         # 刷新失败时保留当前会话中已经加载的历史记录。
-        st.warning(f"Unable to refresh chat history: {error}")
+        LOGGER.exception("Unable to refresh chat history for user=%s", username)
+        st.warning(
+            "Unable to refresh chat history. Existing messages are still "
+            "available."
+        )
 
     # The current input is already rendered as a live chat bubble below this
     # fragment. Exclude its in-memory pending record during timed refreshes so
@@ -179,7 +187,10 @@ def render_chat_page(config: AppConfig) -> None:
         st.markdown(user_input)
 
     result = chat(
-        client=OpenAI(api_key=config.openai_api_key),
+        # Intent and SQL use complete responses; only Answer streams. A bounded
+        # client timeout prevents failed Agent calls from hanging the page.
+        # Intent 和 SQL 使用完整响应，仅 Answer 流式返回；超时限制避免页面长期挂起。
+        client=create_gemini_client(config.gemini_api_key),
         username=st.session_state.username,
         user_input=user_input,
         history_records=st.session_state.chat_records,
@@ -201,8 +212,12 @@ def main() -> None:
     )
     try:
         config = initialize_application()
-    except (OSError, ValueError) as error:
-        st.error(f"Startup error: {error}")
+    except (OSError, ValueError):
+        LOGGER.exception("Application startup failed.")
+        st.error(
+            "The application could not start because its configuration is "
+            "invalid."
+        )
         return
 
     initialize_session_state()

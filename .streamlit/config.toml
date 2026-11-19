@@ -1,0 +1,8 @@
+# Project-level Streamlit runtime settings. No credentials belong in this file.
+# 项目级 Streamlit 运行配置；请勿在此文件中保存任何密钥。
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false

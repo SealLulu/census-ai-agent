@@ -22,13 +22,17 @@ data_source/
   test/                SQL generation, validation, and Snowflake smoke tests
 services/
   history_service.py   JSONL schema, storage, conversion, and chat_id merging
+  llm_service.py       Google Gemini client and shared model configuration
   session_service.py   Single-instance in-memory online-user registry
 startup/
   local_config.toml    Local fallback application settings
-  openai_key.toml      Local OpenAI API key
+  gemini_key.toml      Local Google Gemini API key
   snowflake.toml       Local Snowflake credentials
   requirements.txt     Python dependencies
   start_win.ps1        Windows startup script
+
+.streamlit/
+  config.toml          Non-secret headless/telemetry runtime settings
 chat_history/          Local per-user JSONL chat histories
 ```
 
@@ -45,7 +49,11 @@ Each Python module starts with a bilingual summary and a list of the functions i
 7. `services/history_service.py` owns the JSONL format and merges timed refreshes by `chat_id` so active chats are not duplicated.
 8. `services/session_service.py` allows only one in-memory browser session per username. Explicit Logout releases the username.
 
-For requests that pass Intent without requiring an immediate rejection or clarification, `page.chat` renders transient progress at 25% after Intent and 60% after the Snowflake data-source stage. The Answer Agent then streams its response; after the stream completes the page reaches 100%, persists only the complete response, and reruns so refreshed history displays the complete message. Progress itself is never written to JSONL.
+After receiving text, `page.chat` renders transient progress at 5% before calling the Intent Agent. Intent and Text-to-SQL wait for complete, non-streamed structured responses. Requests that continue through the pipeline advance to 25% after Intent and 60% after the Snowflake data-source stage. Only the Answer Agent streams its response; after the stream completes the page reaches 100%, persists only the complete response, and reruns so refreshed history displays the complete message. Progress itself is never written to JSONL.
+
+All three Agents use Google Gemini's `gemini-3.8-flash` through the native
+Google Gen AI SDK. Intent and Text-to-SQL use JSON Schema-constrained complete
+outputs; Answer uses ordinary streaming output.
 
 `data_source.census_data_service.query_census_data` executes validated read-only `SELECT` statements against the Snowflake-hosted US Open Census Data & Neighborhood Insights - Free Dataset. It serializes the returned columns and rows as `data_input` for answer generation.
 
@@ -65,7 +73,7 @@ The retriever is used by the chat workflow before Text-to-SQL generation. Its re
 
 `data_source.sql_agent.generate_sql` accepts a question plus the compact context returned by `retrieve_schema`. It returns a Pydantic-validated `SQLResult` with either `success` and one Snowflake SELECT statement, or `insufficient_schema` with a reason and the missing definitions. It only generates SQL; it does not validate or execute the statement.
 
-Run the manual generation smoke test after configuring the OpenAI API key. It does not connect to Snowflake:
+Run the manual generation smoke test after configuring the Gemini API key. It does not connect to Snowflake:
 
 ```powershell
 python -m data_source.test.test_sql_agent
@@ -102,9 +110,16 @@ python -m data_source.test.test_snowflake_query
 
 Before starting locally, confirm that:
 
-- `startup/openai_key.toml` contains a valid `OPENAI_API_KEY`.
+- `startup/gemini_key.toml` contains a valid `GEMINI_API_KEY`.
+- For a new workspace, copy `startup/gemini_key.example.toml` to
+  `startup/gemini_key.toml`, then replace the placeholder with your Gemini API key.
 - `startup/local_config.toml` contains an `ALLOWED_USERS` list and a positive integer `CHAT_HISTORY_LOAD_LIMIT`.
 - `startup/snowflake.toml` contains valid local Snowflake connection settings.
+
+The tracked `.streamlit/config.toml` contains runtime settings only—never
+credentials. It enables headless mode and disables usage-stat collection so a
+fresh workspace can start without Streamlit's first-run email prompt or a write
+to the user's global `.streamlit` directory.
 
 Example local configuration:
 
@@ -136,11 +151,13 @@ any credential. The connector account identifier
 uses the `organization-account` form; the Snowflake login name is still required
 separately.
 
-On a server, Streamlit Secrets take priority for `OPENAI_API_KEY`, `ALLOWED_USERS`, `CHAT_HISTORY_LOAD_LIMIT`, and the `[SNOWFLAKE]` table. Local files are used as fallbacks.
+On a server, Streamlit Secrets take priority for `GEMINI_API_KEY`, `ALLOWED_USERS`, `CHAT_HISTORY_LOAD_LIMIT`, and the `[SNOWFLAKE]` table. Local files are used as fallbacks.
 
 Example Streamlit Secrets section:
 
 ```toml
+GEMINI_API_KEY = "YOUR_GEMINI_API_KEY"
+
 [SNOWFLAKE]
 auth_method = "PROGRAMMATIC_ACCESS_TOKEN"
 account = "YOUR_ORG-YOUR_ACCOUNT"
@@ -164,7 +181,7 @@ Each line uses this format:
 - `chat_id`: a UUID that uniquely identifies one question/answer record and prevents duplicates during timed refresh.
 - `text`: the original user input displayed in the chat UI.
 - `rewritten_question`: the standalone question produced by the Intent Agent and used for Agent history, Schema Retrieval, Text-to-SQL, and answer generation. Legacy rows fall back to `text`.
-- `valid_status`: `0` means valid; `-1` means invalid. Invalid records keep `response` empty and the page displays `我无法回复你的问题`.
+- `valid_status`: `0` means valid; `-1` means invalid. Invalid records keep `response` empty and the page displays `I cannot answer that question.`
 - `response_status`: `0` means normal/completed; a non-zero value means the technical execution is still processing or failed before completion. Such records currently display only the user question; this is separate from semantic clarification state.
 - `intent_status`: stores `INVALID`, `NEW`, or `FOLLOW_UP`, allowing history reloads to truncate the pending chain at a `NEW` boundary.
 - `resolution`: stores `NONE`, `NEEDS_CLARIFICATION`, or `RESOLVED_PENDING`. `FOLLOW_UP` controls whether answer generation receives recent history; `NEEDS_CLARIFICATION` ends the current pipeline immediately and returns the Intent Agent's clarification question.
@@ -185,3 +202,7 @@ powershell -ExecutionPolicy Bypass -File .\startup\start_win.ps1
 pip install -r startup/requirements.txt
 streamlit run streamlit_app.py
 ```
+
+Run the manual commands from the repository root so Streamlit discovers
+`.streamlit/config.toml`. The Windows startup script changes to that directory
+automatically and also passes the same safe settings explicitly.

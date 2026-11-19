@@ -11,7 +11,7 @@ Functions / 包含函数:
 - load_local_config: Load local fallback settings. / 读取本地备用配置。
 - load_allowed_users: Load the user allowlist. / 读取允许用户列表。
 - load_chat_history_limit: Load the history tail limit. / 读取历史记录加载数量。
-- load_api_key: Load the OpenAI API key. / 读取 OpenAI API Key。
+- load_gemini_api_key: Load the Gemini API key. / 读取 Gemini API Key。
 - load_snowflake_config: Load Snowflake settings. / 读取 Snowflake 配置。
 - load_config: Validate and assemble AppConfig. / 校验并组装 AppConfig。
 - ensure_chat_storage: Create or migrate user history files. / 创建或迁移用户记录文件。
@@ -53,7 +53,7 @@ class AppConfig:
     """Validated application settings. / 已完成校验的应用配置。"""
 
     allowed_users: list[str]
-    openai_api_key: str
+    gemini_api_key: str
     chat_history_load_limit: int
     snowflake: SnowflakeConfig
 
@@ -187,29 +187,29 @@ def load_chat_history_limit() -> int:
     return load_limit
 
 
-def load_api_key() -> str | None:
-    """Load the API key in priority order. / 按优先级读取 API Key。"""
+def load_gemini_api_key() -> str | None:
+    """Load the Gemini API key in priority order. / 按优先级读取 Gemini API Key。"""
     # Priority: server secret -> local key file -> environment variable.
     # 优先级：服务器 Secret -> 本地密钥文件 -> 环境变量。
     try:
-        api_key = st.secrets["OPENAI_API_KEY"]
+        api_key = st.secrets["GEMINI_API_KEY"]
     except Exception:
         api_key = None
 
     if not api_key:
-        local_key_path = STARTUP_DIR / "openai_key.toml"
+        local_key_path = STARTUP_DIR / "gemini_key.toml"
         try:
             with local_key_path.open("rb") as local_key_file:
-                api_key = tomllib.load(local_key_file).get("OPENAI_API_KEY")
+                api_key = tomllib.load(local_key_file).get("GEMINI_API_KEY")
         except FileNotFoundError:
             api_key = None
         except tomllib.TOMLDecodeError as error:
             raise ValueError(f"Invalid TOML file: {local_key_path}") from error
 
-    if api_key is None:
-        api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        api_key = os.getenv("GEMINI_API_KEY")
     if api_key is not None and not isinstance(api_key, str):
-        raise ValueError("OPENAI_API_KEY must be a string.")
+        raise ValueError("GEMINI_API_KEY must be a string.")
 
     return api_key.strip() if api_key else None
 
@@ -299,17 +299,17 @@ def load_config() -> AppConfig:
         raise ValueError("ALLOWED_USERS must contain at least one username.")
 
     chat_history_load_limit = load_chat_history_limit()
-    openai_api_key = load_api_key()
-    if not openai_api_key:
+    gemini_api_key = load_gemini_api_key()
+    if not gemini_api_key:
         raise ValueError(
-            "OPENAI_API_KEY was not found in Streamlit Secrets, "
-            "startup/openai_key.toml, or the local environment."
+            "GEMINI_API_KEY was not found in Streamlit Secrets, "
+            "startup/gemini_key.toml, or the local environment."
         )
     snowflake_config = load_snowflake_config()
 
     return AppConfig(
         allowed_users=allowed_users,
-        openai_api_key=openai_api_key,
+        gemini_api_key=gemini_api_key,
         chat_history_load_limit=chat_history_load_limit,
         snowflake=snowflake_config,
     )

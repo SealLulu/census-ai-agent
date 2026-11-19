@@ -5,7 +5,9 @@ $projectRoot = Split-Path -Parent $startupRoot
 $venvPath = Join-Path $projectRoot ".venv"
 $pythonPath = Join-Path $venvPath "Scripts\python.exe"
 
-Set-Location $startupRoot
+# Run from the repository root so Streamlit can discover the tracked
+# project-level .streamlit/config.toml in a clean workspace.
+Set-Location $projectRoot
 
 if (-not (Test-Path -LiteralPath $pythonPath)) {
     Write-Host "Creating Python virtual environment..."
@@ -27,4 +29,6 @@ Write-Host "Installing project dependencies..."
 Write-Host "Starting Streamlit at http://127.0.0.1:8501 ..."
 & $pythonPath -m streamlit run (Join-Path $projectRoot "streamlit_app.py") `
     --server.address 127.0.0.1 `
-    --server.port 8501
+    --server.port 8501 `
+    --server.headless true `
+    --browser.gatherUsageStats false

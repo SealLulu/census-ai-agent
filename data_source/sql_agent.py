@@ -12,13 +12,39 @@ Functions / 包含函数:
 import json
 from typing import Any, Literal
 
-from openai import OpenAI
+from google.genai import Client, types
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from data_source.census_data_service import CENSUS_DATABASE
+from services.llm_service import GEMINI_MODEL_NAME
 
 
-MODEL_NAME = "gpt-4o-mini"
+MODEL_NAME = GEMINI_MODEL_NAME
+
+SQL_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "census_sql_result",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": ["success", "insufficient_schema"],
+                },
+                "sql": {"type": "string"},
+                "reason": {"type": "string"},
+                "required_schema": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+            },
+            "required": ["status", "sql", "reason", "required_schema"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 
 class SQLResult(BaseModel):
@@ -89,11 +115,12 @@ Rules:
     requested year. Prefer UNION ALL with an explicit census_year label when the
     same metric is comparable across years. Never JOIN different years unless a
     verified cross-year relationship is provided.
+15. The reason and required_schema fields must always be written in English.
 """
 
 
 def generate_sql(
-    client: OpenAI,
+    client: Client,
     question: str,
     schema_context: dict[str, Any],
     schema_name: str = "PUBLIC",
@@ -110,25 +137,23 @@ def generate_sql(
     if not isinstance(schema_name, str) or not schema_name.strip():
         raise ValueError("schema_name must be a non-empty string.")
 
-    completion = client.chat.completions.create(
+    completion = client.models.generate_content(
         model=MODEL_NAME,
-        response_format={"type": "json_object"},
-        messages=[
-            {
-                "role": "system",
-                "content": _system_prompt(CENSUS_DATABASE, schema_name.strip()),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Question:\n{question.strip()}\n\n"
-                    "Retrieved schema context:\n"
-                    + json.dumps(schema_context, ensure_ascii=False, default=str)
-                ),
-            },
-        ],
+        contents=(
+            f"Question:\n{question.strip()}\n\n"
+            "Retrieved schema context:\n"
+            + json.dumps(schema_context, ensure_ascii=False, default=str)
+        ),
+        config=types.GenerateContentConfig(
+            system_instruction=_system_prompt(
+                CENSUS_DATABASE, schema_name.strip()
+            ),
+            response_mime_type="application/json",
+            response_json_schema=SQL_RESPONSE_FORMAT["json_schema"]["schema"],
+            temperature=0,
+        ),
     )
-    content = completion.choices[0].message.content or ""
+    content = completion.text or ""
     try:
         return SQLResult.model_validate_json(content)
     except ValidationError as error:

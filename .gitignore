@@ -168,8 +168,8 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-# Local OpenAI credential
-startup/openai_key.toml
+# Local Gemini credential
+startup/gemini_key.toml
 
 # Local Snowflake credentials
 startup/snowflake.toml

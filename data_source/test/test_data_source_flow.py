@@ -16,13 +16,12 @@ import json
 import re
 from typing import Any
 
-from openai import OpenAI
-
-from cold_start import load_api_key, load_snowflake_config
+from cold_start import load_gemini_api_key, load_snowflake_config
 from data_source.census_data_service import CENSUS_DATABASE, query_census_data
 from data_source.schema_retriever import retrieve_schema
 from data_source.sql_agent import generate_sql
 from data_source.sql_validator import validate_sql
+from services.llm_service import create_gemini_client
 
 
 DEFAULT_QUESTION = (
@@ -116,13 +115,13 @@ def main() -> None:
     )
     print_schema_summary(schema_context)
 
-    api_key = load_api_key()
+    api_key = load_gemini_api_key()
     if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is not configured.")
+        raise RuntimeError("GEMINI_API_KEY is not configured.")
     snowflake = load_snowflake_config()
 
     generated = generate_sql(
-        client=OpenAI(api_key=api_key),
+        client=create_gemini_client(api_key),
         question=question,
         schema_context=schema_context,
         schema_name=snowflake.schema,
