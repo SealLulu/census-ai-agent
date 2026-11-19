@@ -23,7 +23,7 @@ import os
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from uuid import uuid4
 
 import streamlit as st
@@ -56,6 +56,39 @@ class AppConfig:
     gemini_api_key: str
     chat_history_load_limit: int
     snowflake: SnowflakeConfig
+
+
+def _normalize_snowflake_account(
+    account: str,
+    local_account: object = None,
+) -> str:
+    """Normalize remote account forms without exposing credentials.
+
+    标准化远程 Snowflake account 格式，且不接触或暴露认证凭据。
+    """
+    normalized = account.strip()
+    if "://" in normalized:
+        hostname = urlparse(normalized).hostname
+        if hostname:
+            normalized = hostname
+    suffix = ".snowflakecomputing.com"
+    if normalized.lower().endswith(suffix):
+        normalized = normalized[: -len(suffix)]
+    normalized = normalized.strip().strip("/").replace("/", "-")
+
+    # A remote value may contain only the account name (for example VFC42336).
+    # Reuse the locally configured organization prefix when it is an exact suffix
+    # match instead of constructing an invalid account endpoint.
+    # 远程值可能只有 account 名；若与本地完整账号后缀精确匹配，则复用本地组织前缀。
+    if (
+        isinstance(local_account, str)
+        and local_account.strip()
+        and "-" not in normalized
+        and "." not in normalized
+        and local_account.strip().upper().endswith("-" + normalized.upper())
+    ):
+        normalized = local_account.strip()
+    return normalized
 
 
 def get_chat_history_path(username: str) -> Path:
@@ -268,7 +301,17 @@ def load_snowflake_config() -> SnowflakeConfig:
             raise ValueError(
                 f"SNOWFLAKE.{field} must be configured as a non-empty string."
             )
-        values[field] = value.strip()
+        normalized_value = value.strip()
+        if field == "account":
+            normalized_value = _normalize_snowflake_account(
+                normalized_value,
+                local_section.get("account"),
+            )
+            if not normalized_value:
+                raise ValueError(
+                    "SNOWFLAKE.account must resolve to a non-empty account identifier."
+                )
+        values[field] = normalized_value
 
     auth_method_value = read_value("auth_method") or "password"
     if not isinstance(auth_method_value, str):

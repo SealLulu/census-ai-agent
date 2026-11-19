@@ -68,6 +68,9 @@ def query_census_data(
         "schema": config.schema,
         "login_timeout": CONNECTION_TIMEOUT_SECONDS,
         "network_timeout": QUERY_TIMEOUT_SECONDS,
+        # Explicitly close the server session with this short-lived request.
+        # 短请求结束时明确关闭服务端会话，避免连接器推断 keep-alive 行为。
+        "client_session_keep_alive": False,
         "session_parameters": {
             "STATEMENT_TIMEOUT_IN_SECONDS": QUERY_TIMEOUT_SECONDS,
             "QUERY_TAG": "census-ai-agent",
@@ -75,6 +78,14 @@ def query_census_data(
     }
     if config.role:
         connection_parameters["role"] = config.role
+    # Connector 5.x introduced this option; set it only when available so the
+    # same code remains compatible with the pinned 4.8.1 deployment driver.
+    # Connector 5.x 新增该参数；仅在对应版本设置，以兼容部署固定的 4.8.1。
+    connector_major = int(snowflake.connector.__version__.split(".", 1)[0])
+    if connector_major >= 5:
+        connection_parameters[
+            "enable_server_session_keep_alive_auto_detection"
+        ] = False
 
     # OAuth uses a short-lived access token; password mode remains available locally.
     # OAuth 使用短期访问 token；本地环境仍兼容密码认证模式。

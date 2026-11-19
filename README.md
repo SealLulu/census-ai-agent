@@ -174,6 +174,14 @@ SNOWFLAKE_WAREHOUSE = "COMPUTE_WH"
 SNOWFLAKE_TOKEN = "YOUR_PROGRAMMATIC_ACCESS_TOKEN"
 ```
 
+`SNOWFLAKE_ACCOUNT` should normally use the complete `organization-account`
+identifier. If the remote secret contains only the account name and it exactly
+matches the suffix of the local full identifier, cold start safely restores the
+local organization prefix. Full `https://...snowflakecomputing.com` account URLs
+are also normalized. The project pins Snowflake Connector 4.8.1 for consistent
+Python 3.14 deployment behavior instead of automatically adopting a new major
+connector release.
+
 ## Chat history
 
 Chat history is stored locally in `chat_history` using JSON Lines (`.jsonl`), with one complete Q&A record per line. Login loads only the latest `CHAT_HISTORY_LOAD_LIMIT` records. The directory is retained in Git through `.gitkeep`, while generated history files are ignored.

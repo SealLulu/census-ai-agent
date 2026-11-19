@@ -89,6 +89,7 @@ def _connection_parameters(config: SnowflakeConfig) -> dict[str, Any]:
         "schema": config.schema,
         "login_timeout": 10,
         "network_timeout": 60,
+        "client_session_keep_alive": False,
         "session_parameters": {
             "STATEMENT_TIMEOUT_IN_SECONDS": 60,
             "QUERY_TAG": "census-ai-agent-relationship-validation",
@@ -96,6 +97,9 @@ def _connection_parameters(config: SnowflakeConfig) -> dict[str, Any]:
     }
     if config.role:
         parameters["role"] = config.role
+    connector_major = int(snowflake.connector.__version__.split(".", 1)[0])
+    if connector_major >= 5:
+        parameters["enable_server_session_keep_alive_auto_detection"] = False
     if config.auth_method == "oauth":
         parameters.update(authenticator="oauth", token=config.token)
     elif config.auth_method == "programmatic_access_token":

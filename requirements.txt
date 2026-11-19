@@ -2,4 +2,4 @@ streamlit
 google-genai
 pydantic
 sqlglot
-snowflake-connector-python
+snowflake-connector-python==4.8.1
