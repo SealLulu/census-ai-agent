@@ -10,6 +10,7 @@ Functions / 包含函数:
 - chat: Process and persist one user input. / 处理并保存一次用户输入。
 """
 
+import logging
 from typing import Any
 
 import streamlit as st
@@ -18,6 +19,10 @@ from openai import OpenAI
 import chat as chat_workflow
 from cold_start import SnowflakeConfig
 from services import history_service
+
+
+LOGGER = logging.getLogger(__name__)
+SERVICE_ERROR_TEXT = "当前服务异常，请稍等~"
 
 
 def load_history(username: str, load_limit: int) -> list[dict[str, Any]]:
@@ -57,6 +62,20 @@ def chat(
     )
     history_records.append(pending_record)
 
+    # The progress widget is created lazily only after Intent allows the request
+    # to enter the data pipeline. Progress is never persisted to JSONL.
+    # 仅当 Intent 允许进入数据流程后才创建进度条；进度状态不写入 JSONL。
+    progress_bar: Any | None = None
+
+    def render_progress(percent: int, label: str) -> None:
+        """Render transient pipeline progress. / 渲染不落盘的流程进度。"""
+        nonlocal progress_bar
+        progress_text = f"{percent}% · {label}"
+        if progress_bar is None:
+            progress_bar = st.progress(percent, text=progress_text)
+        else:
+            progress_bar.progress(percent, text=progress_text)
+
     try:
         history_messages = history_service.records_to_model_messages(
             history_records[:-1]
@@ -67,17 +86,25 @@ def chat(
             history_messages=history_messages,
             pending_list=pending_list,
             snowflake_config=snowflake_config,
+            progress_callback=render_progress,
         )
 
-        if flow_result.update_pending:
-            if flow_result.status == history_service.INTENT_STATUS_NEW:
+        # Resolution is the single source of truth for clarification state.
+        # resolution 是澄清状态的唯一依据，避免额外布尔状态产生冲突。
+        if flow_result.status != history_service.VALID_STATUS_INVALID:
+            if (
+                flow_result.intent_status
+                == history_service.INTENT_STATUS_NEW
+            ):
                 # NEW always starts a separate chain, including an incomplete
                 # new question that immediately requires clarification.
                 # NEW 始终开启新链，包括尚不完整、需要立即澄清的新问题。
                 pending_list.clear()
 
             if (
-                flow_result.pending_question
+                flow_result.resolution
+                == history_service.RESOLUTION_NEEDS_CLARIFICATION
+                and flow_result.pending_question
                 and flow_result.pending_clarification
             ):
                 # Each clarification turn is appended. This preserves repeated
@@ -108,13 +135,14 @@ def chat(
             "pending_clarification", ""
         )
 
-        if not flow_result.is_valid:
+        if flow_result.status == history_service.VALID_STATUS_INVALID:
             final_record = history_service.build_history_record(
                 chat_id=chat_id,
                 user_input=user_input,
-                valid_status=history_service.VALID_STATUS_INVALID,
+                valid_status=flow_result.status,
                 rewritten_question=flow_result.rewritten_question,
-                intent_status=flow_result.status,
+                intent_status=flow_result.intent_status,
+                resolution=flow_result.resolution,
                 pending_question=pending_question,
                 pending_clarification=pending_clarification,
             )
@@ -128,10 +156,11 @@ def chat(
             final_record = history_service.build_history_record(
                 chat_id=chat_id,
                 user_input=user_input,
-                valid_status=history_service.VALID_STATUS_VALID,
+                valid_status=flow_result.status,
                 rewritten_question=flow_result.rewritten_question,
                 response=flow_result.direct_response,
-                intent_status=flow_result.status,
+                intent_status=flow_result.intent_status,
+                resolution=flow_result.resolution,
                 pending_question=pending_question,
                 pending_clarification=pending_clarification,
             )
@@ -142,15 +171,18 @@ def chat(
                 )
             with st.chat_message("assistant"):
                 response = st.write_stream(flow_result.answer_stream)
+            if progress_bar is not None:
+                progress_bar.progress(100, text="100% · Answer complete")
             final_record = history_service.build_history_record(
                 chat_id=chat_id,
                 user_input=user_input,
-                valid_status=history_service.VALID_STATUS_VALID,
+                valid_status=flow_result.status,
                 rewritten_question=flow_result.rewritten_question,
                 response=str(response),
                 sql=flow_result.sql,
                 sql_resp=flow_result.sql_response,
-                intent_status=flow_result.status,
+                intent_status=flow_result.intent_status,
+                resolution=flow_result.resolution,
                 pending_question=pending_question,
                 pending_clarification=pending_clarification,
             )
@@ -158,14 +190,29 @@ def chat(
         history_service.append_history_record(username, final_record)
         history_records[-1] = final_record
         return final_record
-    except Exception as error:
+    except Exception:
         # A failed request remains pending on disk for later recovery/retry logic.
         # 失败请求以 pending 状态保存，方便后续增加恢复或重试逻辑。
+        LOGGER.exception(
+            "Chat processing failed for user=%s chat_id=%s",
+            username,
+            chat_id,
+        )
         try:
             history_service.append_history_record(username, pending_record)
-        except (OSError, ValueError) as save_error:
-            st.error(f"Unable to save pending chat: {save_error}")
-        st.error(f"An error occurred while processing the chat: {error}")
-        return pending_record
+        except (OSError, ValueError):
+            LOGGER.exception(
+                "Unable to save pending chat for user=%s chat_id=%s",
+                username,
+                chat_id,
+            )
+        with st.chat_message("assistant"):
+            st.markdown(SERVICE_ERROR_TEXT)
+        # Returning None prevents the caller from immediately rerunning and
+        # clearing the transient service-error message from the current page.
+        # 返回 None 可避免调用方立即重跑，导致当前页面上的服务异常提示被清除。
+        return None
     finally:
+        if progress_bar is not None:
+            progress_bar.empty()
         active_chat_ids.discard(chat_id)

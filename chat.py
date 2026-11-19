@@ -10,7 +10,7 @@ Functions / 包含函数:
 
 from dataclasses import dataclass
 import re
-from typing import Any
+from typing import Any, Callable
 
 from openai import OpenAI
 
@@ -20,20 +20,23 @@ from data_source import census_data_service, schema_retriever, sql_agent
 
 
 MAX_INTENT_HISTORY_MESSAGES = 10
+CHAT_STATUS_VALID = 0
+CHAT_STATUS_INVALID = -1
+ProgressCallback = Callable[[int, str], None]
 
 
 @dataclass(frozen=True)
 class ChatFlowResult:
     """Result passed from workflow to page. / 从聊天主流程返回给页面的结果。"""
 
-    is_valid: bool
-    status: str
+    status: int
+    intent_status: str
     sql: str
     sql_response: str
+    resolution: str = ""
     rewritten_question: str = ""
     answer_stream: Any | None = None
     direct_response: str = ""
-    update_pending: bool = False
     pending_question: str | None = None
     pending_clarification: str | None = None
 
@@ -44,6 +47,7 @@ def run_chat_flow(
     history_messages: list[dict[str, str]],
     pending_list: list[dict[str, str]],
     snowflake_config: SnowflakeConfig,
+    progress_callback: ProgressCallback | None = None,
 ) -> ChatFlowResult:
     """Run intent, optional data query, and answer generation. / 执行意图、查询与生成。"""
     recent_history = history_messages[-MAX_INTENT_HISTORY_MESSAGES:]
@@ -58,10 +62,11 @@ def run_chat_flow(
     )
     if not intent_result.is_valid:
         return ChatFlowResult(
-            is_valid=False,
-            status=intent_result.status,
+            status=CHAT_STATUS_INVALID,
+            intent_status=intent_result.status,
             sql="",
             sql_response="",
+            resolution=intent_result.resolution,
             rewritten_question="",
         )
 
@@ -72,37 +77,47 @@ def run_chat_flow(
         == intent_agent.RESOLUTION_NEEDS_CLARIFICATION
     ):
         return ChatFlowResult(
-            is_valid=True,
-            status=intent_result.status,
+            status=CHAT_STATUS_VALID,
+            intent_status=intent_result.status,
             sql="",
             sql_response="",
+            resolution=intent_result.resolution,
             rewritten_question=intent_result.standalone_question,
             direct_response=intent_result.response_text,
-            update_pending=True,
             pending_question=intent_result.standalone_question,
             pending_clarification=intent_result.response_text,
         )
+
+    # Progress is UI-only and begins only after Intent allows the data pipeline.
+    # 进度只用于页面展示；仅当 Intent 允许继续时才启动数据流程进度。
+    if progress_callback:
+        progress_callback(25, "Intent complete")
 
     # Step 2: retrieve only the Schema required by the standalone question.
     # 第二步：只检索独立问题所需的 Schema。
     year_matches = re.findall(
         r"\b(?:19|20)\d{2}\b", intent_result.standalone_question
     )
-    schema_year = int(year_matches[-1]) if year_matches else 2020
+    # Preserve all explicitly requested years for comparisons. When no year is
+    # present, use the latest supported Catalog year as the current default.
+    # 跨年比较保留所有显式年份；未指定年份时默认使用当前最新的 2020 Catalog。
+    schema_years = list(
+        dict.fromkeys(int(year) for year in year_matches)
+    ) or [2020]
     try:
         schema_context = schema_retriever.retrieve_schema(
             intent_result.standalone_question,
-            year=schema_year,
+            years=schema_years,
         )
     except (FileNotFoundError, ValueError) as error:
         return ChatFlowResult(
-            is_valid=True,
-            status=intent_result.status,
+            status=CHAT_STATUS_VALID,
+            intent_status=intent_result.status,
             sql="",
             sql_response="",
+            resolution=intent_result.resolution,
             rewritten_question=intent_result.standalone_question,
             direct_response=f"Unable to retrieve the required Census schema: {error}",
-            update_pending=True,
         )
 
     # Step 3: generate schema-grounded SQL. It is still not executed here.
@@ -117,13 +132,13 @@ def run_chat_flow(
         missing = ", ".join(generated_sql.required_schema)
         detail = f" Required schema: {missing}." if missing else ""
         return ChatFlowResult(
-            is_valid=True,
-            status=intent_result.status,
+            status=CHAT_STATUS_VALID,
+            intent_status=intent_result.status,
             sql="",
             sql_response="",
+            resolution=intent_result.resolution,
             rewritten_question=intent_result.standalone_question,
             direct_response=generated_sql.reason + detail,
-            update_pending=True,
         )
 
     # Step 4: validation occurs inside the connector before Snowflake execution.
@@ -133,6 +148,8 @@ def run_chat_flow(
         snowflake_config,
         schema_context,
     )
+    if progress_callback:
+        progress_callback(60, "Census data ready")
 
     # Step 5: FOLLOW_UP receives recent history; NEW receives no history.
     # 第五步：FOLLOW_UP 带入最近历史；NEW 不带入历史。
@@ -148,13 +165,11 @@ def run_chat_flow(
         data_input=data_input,
     )
     return ChatFlowResult(
-        is_valid=True,
-        status=intent_result.status,
+        status=CHAT_STATUS_VALID,
+        intent_status=intent_result.status,
         sql=generated_sql.sql,
         sql_response=data_input or "",
+        resolution=intent_result.resolution,
         rewritten_question=intent_result.standalone_question,
         answer_stream=stream,
-        # Any completed NEW/FOLLOW_UP clears previous pending state.
-        # 完成 NEW/FOLLOW_UP 后清除旧的待澄清状态。
-        update_pending=True,
     )

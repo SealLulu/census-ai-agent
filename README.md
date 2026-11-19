@@ -45,11 +45,19 @@ Each Python module starts with a bilingual summary and a list of the functions i
 7. `services/history_service.py` owns the JSONL format and merges timed refreshes by `chat_id` so active chats are not duplicated.
 8. `services/session_service.py` allows only one in-memory browser session per username. Explicit Logout releases the username.
 
+For requests that pass Intent without requiring an immediate rejection or clarification, `page.chat` renders transient progress at 25% after Intent and 60% after the Snowflake data-source stage. The Answer Agent then streams its response; after the stream completes the page reaches 100%, persists only the complete response, and reruns so refreshed history displays the complete message. Progress itself is never written to JSONL.
+
 `data_source.census_data_service.query_census_data` executes validated read-only `SELECT` statements against the Snowflake-hosted US Open Census Data & Neighborhood Insights - Free Dataset. It serializes the returned columns and rows as `data_input` for answer generation.
+
+The Intent Agent is also the operational scope guardrail: unrelated, unsupported, prompt-injection, private/individual-level, and non-US requests fail closed as `INVALID`. The Answer Agent treats current Snowflake rows and relevant prior assistant answers as its only factual evidence. It checks whether that evidence covers the complete request, answers only supported portions when coverage is partial, and returns a fixed no-data response when no requested component is supported. Empty or truncated results, CBG samples, estimates, margins of error, medians, percentages, and cross-year comparisons are handled conservatively rather than extrapolated.
 
 ## Schema Catalog
 
-Place the generated metadata-only Catalog at `data_source/census_schema_catalog.sqlite`. `data_source.schema_retriever.retrieve_schema(question, year=2020)` opens it in read-only mode, searches `field_search` with SQLite FTS5, restricts results to the requested `{year}_CBG_%` tables, and returns at most 20 ranked fields by default. Normal questions exclude `MarginOfError` twins; questions explicitly asking for margin of error retrieve them. Results include type, table number, topic, universe, field path, and kind. The returned context also describes the `CENSUS_BLOCK_GROUP` geographic join and state/county FIPS prefix filters.
+Place the generated metadata-only Catalog at `data_source/census_schema_catalog.sqlite`. The same SQLite file contains `columns`, the FTS5 `field_search` index, candidate `relationships`, and `table_semantics`. `data_source.schema_retriever.retrieve_schema(question, years=[2019, 2020])` opens it once in read-only mode and searches all relevant `{year}_%` tables independently for every requested year, including regular CBG tables, Redistricting tables, and geographic metadata. A single-year request uses `[2019]` or `[2020]`; the application defaults to `[2020]` when the question contains no year.
+
+The Retriever first obtains a wider FTS5 candidate pool, filters ordinary questions toward Estimate fields instead of MarginOfError fields, and then re-ranks candidates using phrase coverage, business descriptions, and total-population semantics. Its response contains enriched `tables`, ranked `columns`, related JOIN paths, related-table columns, and explicit `warnings`. Table-level purpose information is included where `table_semantics` provides it; remaining tables continue to rely on `table_title`, `topics`, `universe`, and `field_path`. For compatibility, a single year can also be passed as `year=2020`; do not pass `year` and `years` together.
+
+Catalog relationships currently have `verification_status = "candidate_unverified"`. They are returned as discovery context, but the SQL Agent is instructed not to generate those JOINs and the SQL Validator rejects them. A relationship must be promoted to `verified` only after Snowflake uniqueness and row-coverage checks. SafeGraph documents CBG/FIPS as the general Census join foundation, but this does not by itself verify every Catalog table relationship.
 
 The retriever is used by the chat workflow before Text-to-SQL generation. Its real Catalog results have been verified for population, household income, housing, and margin-of-error queries.
 
@@ -68,7 +76,20 @@ Before Snowflake execution, `data_source.sql_validator.validate_sql` parses the 
 After configuring a valid API key and all Snowflake credentials, run the manual end-to-end test:
 
 ```powershell
-python -m data_source.test.test_sql_pipeline
+python -m data_source.test.test_data_source_flow
+```
+
+Pass a custom question to inspect the generated SQL and returned data:
+
+```powershell
+python -m data_source.test.test_data_source_flow --question "What is the 2020 median household income for 10 Census block groups?"
+```
+
+For a cross-year query, include both years in the question. You can also pass
+the Catalog years explicitly:
+
+```powershell
+python -m data_source.test.test_data_source_flow --years 2019 2020 --question "Compare 2019 and 2020 median household income for 10 Census block groups."
 ```
 
 To test Snowflake independently without calling GPT, configure only Snowflake and run the fixed, validated 10-row query:
@@ -137,17 +158,18 @@ Chat history is stored locally in `chat_history` using JSON Lines (`.jsonl`), wi
 Each line uses this format:
 
 ```json
-{"chat_id":"","text":"","rewritten_question":"","time_stamp":"","valid_status":0,"response":"","response_status":0,"sql":"","sql_resp":"","intent_status":"","pending_question":"","pending_clarification":""}
+{"chat_id":"","text":"","rewritten_question":"","time_stamp":"","valid_status":0,"response":"","response_status":0,"sql":"","sql_resp":"","intent_status":"","resolution":"","pending_question":"","pending_clarification":""}
 ```
 
 - `chat_id`: a UUID that uniquely identifies one question/answer record and prevents duplicates during timed refresh.
 - `text`: the original user input displayed in the chat UI.
 - `rewritten_question`: the standalone question produced by the Intent Agent and used for Agent history, Schema Retrieval, Text-to-SQL, and answer generation. Legacy rows fall back to `text`.
 - `valid_status`: `0` means valid; `-1` means invalid. Invalid records keep `response` empty and the page displays `我无法回复你的问题`.
-- `response_status`: `0` means normal/completed; a non-zero value means pending. Pending records currently display only the user question.
+- `response_status`: `0` means normal/completed; a non-zero value means the technical execution is still processing or failed before completion. Such records currently display only the user question; this is separate from semantic clarification state.
 - `intent_status`: stores `INVALID`, `NEW`, or `FOLLOW_UP`, allowing history reloads to truncate the pending chain at a `NEW` boundary.
+- `resolution`: stores `NONE`, `NEEDS_CLARIFICATION`, or `RESOLVED_PENDING`. `FOLLOW_UP` controls whether answer generation receives recent history; `NEEDS_CLARIFICATION` ends the current pipeline immediately and returns the Intent Agent's clarification question.
 - `sql` and `sql_resp` are reserved for the Census data-source workflow.
-- `pending_question` and `pending_clarification` store this user's pending-state snapshot after the turn. Login and the one-minute history refresh rebuild at most the latest five unresolved items, starting after the latest `NEW` boundary. The list is kept in the browser's Streamlit session and is not shared between users.
+- `pending_question` and `pending_clarification` store this user's clarification snapshot after the turn. Login and the one-minute history refresh replay `resolution` events to rebuild at most the latest five unresolved items, starting after the latest `NEW` boundary. The list is kept in the browser's Streamlit session and is not shared between users.
 
 ## Run on Windows
 

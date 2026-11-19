@@ -18,7 +18,7 @@ SAMPLE_QUESTION = "2020 median household income"
 def main() -> None:
     """Execute the fixed query through the safe connector. / 通过安全 Connector 执行固定查询。"""
     config = load_snowflake_config()
-    schema_context = retrieve_schema(SAMPLE_QUESTION, year=2020, limit=20)
+    schema_context = retrieve_schema(SAMPLE_QUESTION, years=[2020], limit=20)
     sample_sql = f"""
 SELECT
     t.CENSUS_BLOCK_GROUP,

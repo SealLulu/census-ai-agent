@@ -10,7 +10,7 @@ from data_source.sql_agent import generate_sql
 def main() -> None:
     """Generate SQL for one question without executing it. / 仅生成 SQL，不执行。"""
     question = "What is the median household income in 2020?"
-    schema_context = retrieve_schema(question, limit=20)
+    schema_context = retrieve_schema(question, years=[2020], limit=20)
     api_key = load_api_key()
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not configured.")

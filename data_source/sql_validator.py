@@ -65,19 +65,64 @@ def _schema_permissions(
             {column_name, "CENSUS_BLOCK_GROUP"}
         )
 
-    for section_name in ("geography_join", "fips_lookup"):
-        section = schema_context.get(section_name, {})
-        table_name = str(section.get("table", ""))
+    for table_name, columns in schema_context.get(
+        "relationship_tables", {}
+    ).items():
         if not table_name:
             continue
-        allowed_tables.add(table_name)
-        columns_by_table.setdefault(table_name, set()).update(
+        allowed_tables.add(str(table_name))
+        columns_by_table.setdefault(str(table_name), set()).update(
             str(column.get("column_name", ""))
-            for column in section.get("columns", [])
+            for column in columns
             if column.get("column_name")
         )
 
     return allowed_tables, columns_by_table
+
+
+def _relationship_column_names(value: Any) -> set[str]:
+    """Parse Catalog relationship key names. / 解析 Catalog 关系键字段名。"""
+    return {
+        item.strip().strip('"')
+        for item in str(value).split(",")
+        if item.strip()
+    }
+
+
+def _is_verified_join(
+    join: exp.Join,
+    alias_to_table: dict[str, str],
+    schema_context: dict[str, Any],
+) -> bool:
+    """Check a JOIN against verified Catalog relationships. / 按已验证 Catalog 关系校验 JOIN。"""
+    condition = join.args.get("on")
+    if condition is None:
+        return False
+    joined_table = join.this.name if isinstance(join.this, exp.Table) else ""
+    condition_columns = list(condition.find_all(exp.Column))
+    condition_column_names = {column.name for column in condition_columns}
+    condition_tables = {
+        alias_to_table.get(column.table, column.table)
+        for column in condition_columns
+        if column.table
+    }
+    if joined_table:
+        condition_tables.add(joined_table)
+
+    for relationship in schema_context.get("relationships", []):
+        if str(relationship.get("verification_status", "")).lower() != "verified":
+            continue
+        source_table = str(relationship.get("source_table", ""))
+        target_table = str(relationship.get("target_table", ""))
+        relationship_tables = {source_table, target_table}
+        if not relationship_tables.issubset(condition_tables):
+            continue
+        required_columns = _relationship_column_names(
+            relationship.get("source_columns", "")
+        ) | _relationship_column_names(relationship.get("target_columns", ""))
+        if required_columns and required_columns.issubset(condition_column_names):
+            return True
+    return False
 
 
 def validate_sql(
@@ -170,21 +215,12 @@ def validate_sql(
         elif column_name not in all_allowed_columns:
             errors.append(f"Column is not present in retrieved schema: {column_name}.")
 
-    # Every JOIN must use one of the relationships explicitly supplied by the
-    # retriever: CBG equality or the documented state/county FIPS prefix mapping.
-    # 每个 JOIN 必须使用 Retriever 明确提供的 CBG 等值或 FIPS 前缀关系。
+    # Candidate relationships are discovery metadata only. Execution requires a
+    # Catalog relationship explicitly promoted to verification_status=verified.
+    # 候选关系仅用于发现；只有明确标记 verified 的 Catalog 关系才允许执行 JOIN。
     for join in tree.find_all(exp.Join):
-        condition = join.args.get("on")
-        condition_sql = condition.sql(dialect="snowflake").upper() if condition else ""
-        has_verified_key = (
-            condition_sql.count("CENSUS_BLOCK_GROUP") >= 2
-            or (
-                "CENSUS_BLOCK_GROUP" in condition_sql
-                and ("STATE_FIPS" in condition_sql or "COUNTY_FIPS" in condition_sql)
-            )
-        )
-        if not has_verified_key:
-            errors.append("JOIN does not use a verified Census relationship.")
+        if not _is_verified_join(join, alias_to_table, schema_context):
+            errors.append("JOIN is not backed by a verified Catalog relationship.")
 
     if not referenced_tables:
         errors.append("The query does not reference a retrieved Census table.")

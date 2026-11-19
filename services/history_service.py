@@ -16,6 +16,7 @@ JSONL history format / JSONL 历史记录格式（每行一条完整问答记录
     "sql": "",              # Executed SQL / 执行的 SQL
     "sql_resp": "",         # SQL result / SQL 返回结果
     "intent_status": "",    # INVALID, NEW, or FOLLOW_UP / 本轮意图
+    "resolution": "",       # NONE, NEEDS_CLARIFICATION, or RESOLVED_PENDING
     "pending_question": "", # Pending resolved question / 待补充的问题
     "pending_clarification": "" # Agent clarification / Agent 主动追问
 }
@@ -47,6 +48,15 @@ RESPONSE_STATUS_PENDING = 1
 INVALID_RESPONSE_TEXT = "我无法回复你的问题"
 MAX_PENDING_ITEMS = 5
 INTENT_STATUS_NEW = "NEW"
+RESOLUTION_NONE = "NONE"
+RESOLUTION_NEEDS_CLARIFICATION = "NEEDS_CLARIFICATION"
+RESOLUTION_RESOLVED_PENDING = "RESOLVED_PENDING"
+VALID_RESOLUTIONS = {
+    "",
+    RESOLUTION_NONE,
+    RESOLUTION_NEEDS_CLARIFICATION,
+    RESOLUTION_RESOLVED_PENDING,
+}
 
 STRING_FIELDS = (
     "chat_id",
@@ -57,6 +67,7 @@ STRING_FIELDS = (
     "sql",
     "sql_resp",
     "intent_status",
+    "resolution",
     "pending_question",
     "pending_clarification",
 )
@@ -83,6 +94,16 @@ def _normalize_legacy_record(
     normalized.setdefault("pending_question", "")
     normalized.setdefault("pending_clarification", "")
     normalized.setdefault("intent_status", "")
+    # Legacy clarification rows can be identified by their saved response.
+    # 旧记录没有 resolution；可通过追问回复与 pending 快照识别澄清轮次。
+    legacy_resolution = ""
+    if (
+        normalized.get("pending_clarification")
+        and normalized.get("response")
+        == normalized.get("pending_clarification")
+    ):
+        legacy_resolution = RESOLUTION_NEEDS_CLARIFICATION
+    normalized.setdefault("resolution", legacy_resolution)
     # Old JSONL rows predate question rewriting; their original text remains usable.
     # 旧 JSONL 记录没有改写字段，读取时使用原始问题作为兼容值。
     normalized.setdefault("rewritten_question", str(normalized.get("text", "")))
@@ -107,6 +128,8 @@ def _is_valid_record(record: object) -> bool:
         VALID_STATUS_VALID,
         VALID_STATUS_INVALID,
     ):
+        return False
+    if record["resolution"] not in VALID_RESOLUTIONS:
         return False
     if record["valid_status"] != VALID_STATUS_VALID and record["response"]:
         return False
@@ -174,6 +197,7 @@ def build_history_record(
     sql: str = "",
     sql_resp: str = "",
     intent_status: str = "",
+    resolution: str = "",
     pending_question: str = "",
     pending_clarification: str = "",
 ) -> dict[str, Any]:
@@ -189,6 +213,7 @@ def build_history_record(
         "sql": sql,
         "sql_resp": sql_resp,
         "intent_status": intent_status,
+        "resolution": resolution,
         "pending_question": pending_question,
         "pending_clarification": pending_clarification,
     }
@@ -255,9 +280,44 @@ def get_pending_list(
 
         pending_question = record.get("pending_question", "")
         pending_clarification = record.get("pending_clarification", "")
+        resolution = record.get("resolution", "")
 
-        # An empty snapshot means the pending question was resolved or abandoned.
-        # 空快照表示待澄清问题已经解决，或用户已经切换到新问题。
+        # Invalid input and technical processing records do not change the
+        # semantic clarification chain; they only carry its latest snapshot.
+        # 无效输入和技术处理中记录不改变澄清链，只携带最近的状态快照。
+        if (
+            record.get("valid_status") != VALID_STATUS_VALID
+            or record.get("response_status") == RESPONSE_STATUS_PENDING
+        ):
+            continue
+
+        if resolution == RESOLUTION_NEEDS_CLARIFICATION:
+            if pending_question and pending_clarification:
+                pending_list.append(
+                    {
+                        "chat_id": record["chat_id"],
+                        "text": record["text"],
+                        "time_stamp": record["time_stamp"],
+                        "pending_question": pending_question,
+                        "pending_clarification": pending_clarification,
+                    }
+                )
+                del pending_list[:-MAX_PENDING_ITEMS]
+            continue
+
+        if resolution == RESOLUTION_RESOLVED_PENDING:
+            pending_list.clear()
+            continue
+
+        if resolution == RESOLUTION_NONE:
+            # A normal completed NEW/FOLLOW_UP turn either had no pending
+            # context or replaced it, so no clarification remains active.
+            # 正常完成的一轮没有未解决澄清，或已经替换原澄清链。
+            pending_list.clear()
+            continue
+
+        # Legacy rows without resolution retain the previous inference rules.
+        # 没有 resolution 的旧记录继续使用快照规则兼容读取。
         if not pending_question and not pending_clarification:
             pending_list.clear()
             continue

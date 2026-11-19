@@ -73,6 +73,9 @@ Rules:
 4. Double-quote identifiers that start with digits or require quoting.
 5. Use exact table and column names from the provided schema context.
 6. JOIN tables only when the provided context verifies the relationship.
+   A relationship is verified only when verification_status is exactly "verified".
+   Never JOIN a relationship marked "candidate_unverified"; report
+   insufficient_schema instead when such a JOIN would be required.
 7. Never aggregate a metric unless its aggregation semantics are known.
 8. Do not infer a national, state, or county statistic by averaging block-group values.
 9. Use Estimate fields for ordinary metric questions. Use MarginOfError fields only
@@ -82,6 +85,10 @@ Rules:
 12. For success, return SQL and leave reason/required_schema empty.
 13. For insufficient_schema, return empty SQL, explain why, and list the missing
     tables, columns, join keys, metric semantics, or filters in required_schema.
+14. For a multi-year question, use the matching year-specific tables for every
+    requested year. Prefer UNION ALL with an explicit census_year label when the
+    same metric is comparable across years. Never JOIN different years unless a
+    verified cross-year relationship is provided.
 """
 
 

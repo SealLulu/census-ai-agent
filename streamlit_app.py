@@ -62,26 +62,35 @@ def render_page_header() -> None:
     st.caption(PAGE_SUBTITLE)
 
 
-def render_login(config: AppConfig) -> None:
+def render_login(config: AppConfig) -> bool:
     """Render and validate login. / 渲染并校验登录页面。"""
-    render_page_header()
-    st.subheader("🔐 Login")
-    st.write("Enter your username to continue to the chat.")
+    # Keep the complete login view in one placeholder. After successful login,
+    # it can be removed immediately and the chat can render in the same run.
+    # 将完整登录页面放入同一个占位容器；登录成功后立即清除，并在同一次运行中渲染聊天页。
+    login_area = st.empty()
+    with login_area.container():
+        render_page_header()
+        st.subheader("🔐 Login")
+        st.write("Enter your username to continue to the chat.")
 
-    with st.form("login_form"):
-        username = st.text_input("Username", placeholder="Enter your username")
-        submitted = st.form_submit_button("Continue", use_container_width=True)
+        with st.form("login_form"):
+            username = st.text_input(
+                "Username", placeholder="Enter your username"
+            )
+            submitted = st.form_submit_button(
+                "Continue", use_container_width=True
+            )
 
     if not submitted:
-        return
+        return False
 
     username = username.strip()
     if not username:
         st.warning("Please enter a username.")
-        return
+        return False
     if username not in config.allowed_users:
         st.error("This username is not allowed to access the chat.")
-        return
+        return False
 
     if not acquire_user_session(
         username, st.session_state.browser_session_id
@@ -90,7 +99,7 @@ def render_login(config: AppConfig) -> None:
             "This user is already logged in from another browser session. "
             "Please log out there first."
         )
-        return
+        return False
 
     try:
         records = load_history(username, config.chat_history_load_limit)
@@ -101,13 +110,14 @@ def render_login(config: AppConfig) -> None:
             username, st.session_state.browser_session_id
         )
         st.error(f"Unable to load chat history: {error}")
-        return
+        return False
 
     st.session_state.username = username
     st.session_state.chat_records = records
     st.session_state.active_chat_ids = set()
     st.session_state.pending_list = get_pending_list(records)
-    st.rerun()
+    login_area.empty()
+    return True
 
 
 @st.fragment(run_every="1m")
@@ -215,8 +225,8 @@ def main() -> None:
         st.session_state.pending_list = []
 
     if not st.session_state.username:
-        render_login(config)
-        return
+        if not render_login(config):
+            return
     render_chat_page(config)
 
 
